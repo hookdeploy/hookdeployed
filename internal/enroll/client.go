@@ -29,28 +29,33 @@ type StartResponse struct {
 	ExpiresIn       int    `json:"expires_in"`
 }
 
-type PollResponse struct {
-	Status      string `json:"status"`
-	Interval    int    `json:"interval"`
+type Minted struct {
 	Certificate string `json:"certificate"`
 	CA          string `json:"ca"`
 	CertChain   string `json:"certChain"`
+	Root        string `json:"root"`
 	AgentID     string `json:"agent_id"`
 	OrgID       string `json:"org_id"`
+}
+
+type PollResponse struct {
+	Status   string `json:"status"`
+	Interval int    `json:"interval"`
+	AgentID  string `json:"agent_id"`
+	OrgID    string `json:"org_id"`
+	Minted
 }
 
 type TokenResponse struct {
-	Certificate string `json:"certificate"`
-	CA          string `json:"ca"`
-	CertChain   string `json:"certChain"`
-	AgentID     string `json:"agent_id"`
-	OrgID       string `json:"org_id"`
+	Status  string `json:"status"`
+	AgentID string `json:"agent_id"`
+	OrgID   string `json:"org_id"`
+	Minted
 }
 
-func (c *Client) DeviceStart(csrPEM []byte, orgHint string) (*StartResponse, error) {
+func (c *Client) DeviceStart(orgHint string) (*StartResponse, error) {
 	var out StartResponse
 	if err := c.post("/v1/enroll/device/start", map[string]string{
-		"csr":      string(csrPEM),
 		"org_hint": orgHint,
 	}, &out); err != nil {
 		return nil, err
@@ -58,17 +63,29 @@ func (c *Client) DeviceStart(csrPEM []byte, orgHint string) (*StartResponse, err
 	return &out, nil
 }
 
-func (c *Client) DevicePoll(deviceCode string) (*PollResponse, error) {
+func (c *Client) DevicePoll(deviceCode string, csrPEM []byte) (*PollResponse, error) {
+	body := map[string]string{"device_code": deviceCode}
+	if len(csrPEM) > 0 {
+		body["csr"] = string(csrPEM)
+	}
 	var out PollResponse
-	if err := c.post("/v1/enroll/device/poll", map[string]string{
-		"device_code": deviceCode,
+	if err := c.post("/v1/enroll/device/poll", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) TokenStart(token string) (*TokenResponse, error) {
+	var out TokenResponse
+	if err := c.post("/v1/enroll/token", map[string]string{
+		"token": token,
 	}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-func (c *Client) TokenEnroll(token string, csrPEM []byte) (*TokenResponse, error) {
+func (c *Client) TokenComplete(token string, csrPEM []byte) (*TokenResponse, error) {
 	var out TokenResponse
 	if err := c.post("/v1/enroll/token", map[string]string{
 		"token": token,
@@ -79,11 +96,12 @@ func (c *Client) TokenEnroll(token string, csrPEM []byte) (*TokenResponse, error
 	return &out, nil
 }
 
-func (c *Client) Renew(certificatePEM, caPEM, csrPEM []byte) (*TokenResponse, error) {
+func (c *Client) Renew(certificatePEM, intermediatePEM, rootPEM, csrPEM []byte) (*TokenResponse, error) {
 	var out TokenResponse
 	if err := c.post("/v1/enroll/renew", map[string]string{
 		"certificate": string(certificatePEM),
-		"ca":          string(caPEM),
+		"ca":          string(intermediatePEM),
+		"root":        string(rootPEM),
 		"csr":         string(csrPEM),
 	}, &out); err != nil {
 		return nil, err

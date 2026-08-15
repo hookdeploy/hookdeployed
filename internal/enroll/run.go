@@ -10,12 +10,12 @@ import (
 )
 
 func RunDevice(baseURL, orgHint, certDir string) error {
-	_, csrPEM, keyPEM, err := GenerateKeyAndCSR("pending")
+	key, keyPEM, err := GenerateKey()
 	if err != nil {
 		return err
 	}
 	client := NewClient(baseURL)
-	start, err := client.DeviceStart(csrPEM, orgHint)
+	start, err := client.DeviceStart(orgHint)
 	if err != nil {
 		return err
 	}
@@ -26,9 +26,18 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 	if interval < time.Second {
 		interval = 5 * time.Second
 	}
+
+	var agentID string
 	for time.Now().Before(deadline) {
 		time.Sleep(interval)
-		poll, err := client.DevicePoll(start.DeviceCode)
+		var csrPEM []byte
+		if agentID != "" {
+			csrPEM, err = CSRFromKey(key, agentID)
+			if err != nil {
+				return err
+			}
+		}
+		poll, err := client.DevicePoll(start.DeviceCode, csrPEM)
 		if err != nil {
 			return err
 		}
@@ -44,7 +53,14 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 		case "denied", "expired":
 			return fmt.Errorf("enrollment %s", poll.Status)
 		case "approved":
-			return store.Write(certDir, []byte(poll.CA), []byte(poll.Certificate), keyPEM)
+			if poll.Certificate == "" {
+				if poll.AgentID == "" {
+					return fmt.Errorf("approved poll missing agent_id")
+				}
+				agentID = poll.AgentID
+				continue
+			}
+			return store.WriteBundle(certDir, []byte(poll.Root), []byte(poll.CertChain), []byte(poll.Certificate), []byte(poll.CA), keyPEM)
 		default:
 			return fmt.Errorf("unexpected poll status %q", poll.Status)
 		}
@@ -53,16 +69,27 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 }
 
 func RunToken(baseURL, token, certDir string) error {
-	_, csrPEM, keyPEM, err := GenerateKeyAndCSR("pending")
+	key, keyPEM, err := GenerateKey()
 	if err != nil {
 		return err
 	}
 	client := NewClient(baseURL)
-	out, err := client.TokenEnroll(token, csrPEM)
+	started, err := client.TokenStart(token)
 	if err != nil {
 		return err
 	}
-	return store.Write(certDir, []byte(out.CA), []byte(out.Certificate), keyPEM)
+	if started.AgentID == "" {
+		return fmt.Errorf("token start missing agent_id")
+	}
+	csrPEM, err := CSRFromKey(key, started.AgentID)
+	if err != nil {
+		return err
+	}
+	out, err := client.TokenComplete(token, csrPEM)
+	if err != nil {
+		return err
+	}
+	return store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM)
 }
 
 func MaybeRenew(baseURL, certDir string) error {
@@ -75,11 +102,11 @@ func MaybeRenew(baseURL, certDir string) error {
 	if time.Now().Before(halfway) {
 		return nil
 	}
-	_, csrPEM, keyPEM, err := GenerateKeyAndCSR(material.ClientCert.Subject.CommonName)
+	csrPEM, err := CSRFromKey(material.ClientKey, material.ClientCert.Subject.CommonName)
 	if err != nil {
 		return err
 	}
-	caPEM, err := os.ReadFile(filepath.Join(certDir, "ca.crt"))
+	rootPEM, err := os.ReadFile(filepath.Join(certDir, "ca.crt"))
 	if err != nil {
 		return err
 	}
@@ -88,9 +115,13 @@ func MaybeRenew(baseURL, certDir string) error {
 		return err
 	}
 	client := NewClient(baseURL)
-	out, err := client.Renew(certPEM, caPEM, csrPEM)
+	out, err := client.Renew(certPEM, nil, rootPEM, csrPEM)
 	if err != nil {
 		return err
 	}
-	return store.Write(certDir, []byte(out.CA), []byte(out.Certificate), keyPEM)
+	keyPEM, err := EncodeKey(material.ClientKey)
+	if err != nil {
+		return err
+	}
+	return store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM)
 }
