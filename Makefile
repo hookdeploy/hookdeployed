@@ -4,7 +4,11 @@
 CGO_ENABLED ?= 0
 export CGO_ENABLED
 
-.PHONY: gencerts run-relay run-agent test vet
+.PHONY: gencerts run-relay run-agent test vet build
+
+build:
+	go build -o bin/agent ./cmd/agent
+	go build -o bin/relay-stub ./cmd/relay-stub
 
 gencerts:
 	go run ./cmd/gencerts
