@@ -110,6 +110,17 @@ func (c *Client) Renew(certificatePEM, intermediatePEM, rootPEM, csrPEM []byte) 
 	return &out, nil
 }
 
+func (c *Client) RenewWithToken(renewalToken string, csrPEM []byte) (*TokenResponse, error) {
+	var out TokenResponse
+	if err := c.post("/v1/enroll/renew", map[string]string{
+		"renewal_token": renewalToken,
+		"csr":           string(csrPEM),
+	}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) post(path string, body any, dest any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {

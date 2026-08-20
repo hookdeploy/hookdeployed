@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hookdeploy/hookdeployed/internal/store"
@@ -95,38 +96,61 @@ func RunToken(baseURL, token, certDir string) error {
 	return store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, []byte(out.RenewalToken))
 }
 
+// ShouldRenew reports whether MaybeRenew should hit the network.
+// Past halfway of a healthy leaf, OR the leaf is expired / not yet valid.
+func ShouldRenew(cert *x509.Certificate, now time.Time) bool {
+	if cert == nil {
+		return false
+	}
+	if now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
+		return true
+	}
+	life := cert.NotAfter.Sub(cert.NotBefore)
+	if life <= 0 {
+		return true
+	}
+	halfway := cert.NotBefore.Add(life / 2)
+	return !now.Before(halfway)
+}
+
 func MaybeRenew(baseURL, certDir string) error {
 	material, err := store.Load(certDir)
 	if err != nil {
 		return err
 	}
-	life := material.ClientCert.NotAfter.Sub(material.ClientCert.NotBefore)
-	halfway := material.ClientCert.NotBefore.Add(life / 2)
-	if time.Now().Before(halfway) {
+	if !ShouldRenew(material.ClientCert, time.Now()) {
 		return nil
 	}
 	csrPEM, err := CSRFromKey(material.ClientKey, material.ClientCert.Subject.CommonName)
 	if err != nil {
 		return err
 	}
-	rootPEM, err := os.ReadFile(filepath.Join(certDir, "ca.crt"))
-	if err != nil {
-		return err
-	}
-	certPEM, err := os.ReadFile(filepath.Join(certDir, "client.crt"))
-	if err != nil {
-		return err
-	}
 	client := NewClient(baseURL)
-	out, err := client.Renew(certPEM, nil, rootPEM, csrPEM)
+	var out *TokenResponse
+	if token := strings.TrimSpace(material.RenewalToken); token != "" {
+		out, err = client.RenewWithToken(token, csrPEM)
+	} else {
+		rootPEM, readErr := os.ReadFile(filepath.Join(certDir, "ca.crt"))
+		if readErr != nil {
+			return readErr
+		}
+		certPEM, readErr := os.ReadFile(filepath.Join(certDir, "client.crt"))
+		if readErr != nil {
+			return readErr
+		}
+		out, err = client.Renew(certPEM, nil, rootPEM, csrPEM)
+	}
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(material.RenewalToken) != "" && strings.TrimSpace(out.RenewalToken) == "" {
+		return fmt.Errorf("renew response missing renewal_token")
 	}
 	keyPEM, err := EncodeKey(material.ClientKey)
 	if err != nil {
 		return err
 	}
-	if err := store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, nil); err != nil {
+	if err := store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, []byte(out.RenewalToken)); err != nil {
 		return err
 	}
 	logRenewedLeaf(out.Certificate)

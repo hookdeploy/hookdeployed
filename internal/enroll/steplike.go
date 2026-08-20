@@ -31,7 +31,10 @@ type StepLikeChain struct {
 
 func GenerateStepLikeChain(cn, ou string) (*StepLikeChain, error) {
 	now := time.Now()
+	return GenerateStepLikeChainWindow(cn, ou, now.Add(-time.Hour), now.Add(10*365*24*time.Hour))
+}
 
+func GenerateStepLikeChainWindow(cn, ou string, notBefore, notAfter time.Time) (*StepLikeChain, error) {
 	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -39,8 +42,8 @@ func GenerateStepLikeChain(cn, ou string) (*StepLikeChain, error) {
 	rootTmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: "HookDeploy Root CA"},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(10 * 365 * 24 * time.Hour),
+		NotBefore:             notBefore.Add(-time.Hour),
+		NotAfter:              notAfter.Add(10 * 365 * 24 * time.Hour),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
@@ -61,8 +64,8 @@ func GenerateStepLikeChain(cn, ou string) (*StepLikeChain, error) {
 	intTmpl := &x509.Certificate{
 		SerialNumber:          big.NewInt(2),
 		Subject:               pkix.Name{CommonName: "HookDeploy Intermediate CA"},
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(10 * 365 * 24 * time.Hour),
+		NotBefore:             notBefore.Add(-time.Hour),
+		NotAfter:              notAfter.Add(10 * 365 * 24 * time.Hour),
 		IsCA:                  true,
 		BasicConstraintsValid: true,
 		MaxPathLen:            0,
@@ -85,8 +88,8 @@ func GenerateStepLikeChain(cn, ou string) (*StepLikeChain, error) {
 	leafTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(3),
 		Subject:      pkix.Name{CommonName: cn, OrganizationalUnit: []string{ou}},
-		NotBefore:    now.Add(-time.Hour),
-		NotAfter:     now.Add(10 * 365 * 24 * time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
