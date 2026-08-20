@@ -80,7 +80,7 @@ func TestStepLikeChainReachesRootAndPresentsIntermediate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WriteBundle(dir, chain.RootPEM, chain.CertChainPEM, chain.LeafPEM, chain.IntermediatePEM, keyPEM); err != nil {
+	if err := store.WriteBundle(dir, chain.RootPEM, chain.CertChainPEM, chain.LeafPEM, chain.IntermediatePEM, keyPEM, nil); err != nil {
 		t.Fatal(err)
 	}
 	material, err := store.Load(dir)
@@ -101,6 +101,9 @@ func TestStepLikeChainReachesRootAndPresentsIntermediate(t *testing.T) {
 	}
 	if material.CACert.Equal(chain.Intermediate) {
 		t.Fatal("stored ca.crt is the intermediate — renew/relay will break")
+	}
+	if material.RenewalToken != "" {
+		t.Fatalf("RenewalToken=%q want empty for bundles without a token", material.RenewalToken)
 	}
 
 	opts := x509.VerifyOptions{

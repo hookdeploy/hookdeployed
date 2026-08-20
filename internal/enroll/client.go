@@ -30,12 +30,13 @@ type StartResponse struct {
 }
 
 type Minted struct {
-	Certificate string `json:"certificate"`
-	CA          string `json:"ca"`
-	CertChain   string `json:"certChain"`
-	Root        string `json:"root"`
-	AgentID     string `json:"agent_id"`
-	OrgID       string `json:"org_id"`
+	Certificate  string `json:"certificate"`
+	CA           string `json:"ca"`
+	CertChain    string `json:"certChain"`
+	Root         string `json:"root"`
+	AgentID      string `json:"agent_id"`
+	OrgID        string `json:"org_id"`
+	RenewalToken string `json:"renewal_token"`
 }
 
 type PollResponse struct {

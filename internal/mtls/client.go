@@ -1,6 +1,7 @@
 package mtls
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // ClientMaterial is the enrolled-agent subset.
@@ -24,6 +26,9 @@ type ClientMaterial struct {
 	ClientCert    *x509.Certificate
 	Intermediates []*x509.Certificate
 	ClientKey     *ecdsa.PrivateKey
+	// RenewalToken is the raw hd_agentrenew_… secret from renewal.token.
+	// Empty when the file is absent (agents enrolled before this field).
+	RenewalToken string
 }
 
 func (c *ClientMaterial) CAPool() *x509.CertPool {
@@ -39,6 +44,20 @@ func (c *ClientMaterial) ClientTLSConfig() *tls.Config {
 		ServerName:   DefaultServerName,
 		MinVersion:   tls.VersionTLS13,
 	}
+}
+
+// ClientTLSConfigFor is the production dial config. ServerName must be the
+// relay hostname (SAN), not localhost. Echo/stub keep using ClientTLSConfig().
+func (c *ClientMaterial) ClientTLSConfigFor(serverName string) (*tls.Config, error) {
+	if strings.TrimSpace(serverName) == "" {
+		return nil, fmt.Errorf("server name is required")
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{certChainAndKey(c.ClientCert, c.Intermediates, c.ClientKey)},
+		RootCAs:      c.CAPool(),
+		ServerName:   serverName,
+		MinVersion:   tls.VersionTLS13,
+	}, nil
 }
 
 func certChainAndKey(leaf *x509.Certificate, intermediates []*x509.Certificate, key interface{}) tls.Certificate {
@@ -69,15 +88,20 @@ func LoadClientDir(dir string) (*ClientMaterial, error) {
 	if err != nil {
 		return nil, err
 	}
+	renewalToken, err := loadOptionalSecret(filepath.Join(dir, "renewal.token"))
+	if err != nil {
+		return nil, err
+	}
 	return &ClientMaterial{
 		CACert:        caCert,
 		ClientCert:    chain[0],
 		Intermediates: chain[1:],
 		ClientKey:     clientKey,
+		RenewalToken:  renewalToken,
 	}, nil
 }
 
-func WriteClientDir(dir string, caPEM, certPEM, keyPEM []byte) error {
+func WriteClientDir(dir string, caPEM, certPEM, keyPEM, renewalToken []byte) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -94,6 +118,13 @@ func WriteClientDir(dir string, caPEM, certPEM, keyPEM []byte) error {
 		if err := os.WriteFile(path, f.pem, 0o600); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
 		}
+	}
+	if len(bytes.TrimSpace(renewalToken)) == 0 {
+		return nil
+	}
+	path := filepath.Join(dir, "renewal.token")
+	if err := os.WriteFile(path, bytes.TrimSpace(renewalToken), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }
@@ -124,4 +155,15 @@ func loadCerts(path string) ([]*x509.Certificate, error) {
 		return nil, fmt.Errorf("%s: no certificate PEM", path)
 	}
 	return certs, nil
+}
+
+func loadOptionalSecret(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return string(bytes.TrimSpace(raw)), nil
 }

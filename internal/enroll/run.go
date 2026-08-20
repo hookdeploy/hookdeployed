@@ -63,7 +63,7 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 				agentID = poll.AgentID
 				continue
 			}
-			return store.WriteBundle(certDir, []byte(poll.Root), []byte(poll.CertChain), []byte(poll.Certificate), []byte(poll.CA), keyPEM)
+			return store.WriteBundle(certDir, []byte(poll.Root), []byte(poll.CertChain), []byte(poll.Certificate), []byte(poll.CA), keyPEM, []byte(poll.RenewalToken))
 		default:
 			return fmt.Errorf("unexpected poll status %q", poll.Status)
 		}
@@ -92,7 +92,7 @@ func RunToken(baseURL, token, certDir string) error {
 	if err != nil {
 		return err
 	}
-	return store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM)
+	return store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, []byte(out.RenewalToken))
 }
 
 func MaybeRenew(baseURL, certDir string) error {
@@ -126,7 +126,7 @@ func MaybeRenew(baseURL, certDir string) error {
 	if err != nil {
 		return err
 	}
-	if err := store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM); err != nil {
+	if err := store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, nil); err != nil {
 		return err
 	}
 	logRenewedLeaf(out.Certificate)
