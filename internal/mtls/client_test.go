@@ -81,6 +81,76 @@ func TestWriteAndLoadRenewalToken(t *testing.T) {
 	}
 }
 
+func TestWriteClientDirNilTokenPreservesExistingFile(t *testing.T) {
+	pki, err := GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPEM := encodeCert(pki.CACert.Raw)
+	certPEM := encodeCert(pki.ClientCert.Raw)
+	keyPEM := encodeKey(pki.ClientKey)
+	dir := t.TempDir()
+	if err := WriteClientDir(dir, caPEM, certPEM, keyPEM, []byte("hd_agentrenew_us_keep")); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteClientDir(dir, caPEM, certPEM, keyPEM, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "renewal.token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hd_agentrenew_us_keep" {
+		t.Fatalf("token=%q want preserved", got)
+	}
+}
+
+func TestWriteClientDirTokenSurvivesCertWriteFailure(t *testing.T) {
+	pki, err := GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPEM := encodeCert(pki.CACert.Raw)
+	certPEM := encodeCert(pki.ClientCert.Raw)
+	keyPEM := encodeKey(pki.ClientKey)
+	dir := t.TempDir()
+	if err := WriteClientDir(dir, caPEM, certPEM, keyPEM, []byte("hd_agentrenew_us_old")); err != nil {
+		t.Fatal(err)
+	}
+	oldCert, err := os.ReadFile(filepath.Join(dir, "client.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	caPath := filepath.Join(dir, "ca.crt")
+	if err := os.Remove(caPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(caPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	newToken := []byte("hd_agentrenew_us_new")
+	err = WriteClientDir(dir, []byte("new-ca"), []byte("new-cert"), keyPEM, newToken)
+	if err == nil {
+		t.Fatal("expected write of ca.crt to fail because it is a directory")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "renewal.token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(newToken) {
+		t.Fatalf("token=%q want new (written before certs)", got)
+	}
+	still, err := os.ReadFile(filepath.Join(dir, "client.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(still) != string(oldCert) {
+		t.Fatal("client.crt should still be the old cert after ca.crt write failed")
+	}
+}
+
 func TestLoadClientDirWithoutRenewalToken(t *testing.T) {
 	pki, err := GenerateTestPKI()
 	if err != nil {

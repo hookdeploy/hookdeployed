@@ -29,6 +29,9 @@ func DefaultDir() string {
 // step-ca's sign `ca` field is the intermediate, not the root. Prefer `root`
 // from the worker (GET /1.0/root/{sha}). certChain is [leaf, intermediate].
 // An empty renewalToken leaves an existing renewal.token file untouched.
+// When a token is provided, WriteClientDir writes it BEFORE the cert files
+// so a cert-write failure after rotation is recoverable (new token, old certs)
+// instead of looking like reuse (new certs, stale token).
 func WriteBundle(dir string, rootPEM, certChain, leafPEM, intermediatePEM, keyPEM, renewalToken []byte) error {
 	root := bytes.TrimSpace(rootPEM)
 	chain := bytes.TrimSpace(certChain)

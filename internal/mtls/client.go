@@ -105,6 +105,16 @@ func WriteClientDir(dir string, caPEM, certPEM, keyPEM, renewalToken []byte) err
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	// Token BEFORE cert files. Rotation has already happened on the server
+	// when this runs: if cert writes fail after the token is on disk, the
+	// next MaybeRenew presents the new token and recovers. The reverse
+	// (new certs, stale token) looks like reuse and revokes the chain.
+	if len(bytes.TrimSpace(renewalToken)) > 0 {
+		path := filepath.Join(dir, "renewal.token")
+		if err := os.WriteFile(path, bytes.TrimSpace(renewalToken), 0o600); err != nil {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+	}
 	files := []struct {
 		name string
 		pem  []byte
@@ -118,13 +128,6 @@ func WriteClientDir(dir string, caPEM, certPEM, keyPEM, renewalToken []byte) err
 		if err := os.WriteFile(path, f.pem, 0o600); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
 		}
-	}
-	if len(bytes.TrimSpace(renewalToken)) == 0 {
-		return nil
-	}
-	path := filepath.Join(dir, "renewal.token")
-	if err := os.WriteFile(path, bytes.TrimSpace(renewalToken), 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }
