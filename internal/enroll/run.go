@@ -1,7 +1,10 @@
 package enroll
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -123,5 +126,23 @@ func MaybeRenew(baseURL, certDir string) error {
 	if err != nil {
 		return err
 	}
-	return store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM)
+	if err := store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM); err != nil {
+		return err
+	}
+	logRenewedLeaf(out.Certificate)
+	return nil
+}
+
+func logRenewedLeaf(certPEM string) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		log.Printf("renewed leaf")
+		return
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		log.Printf("renewed leaf")
+		return
+	}
+	log.Printf("renewed leaf not_after=%s", cert.NotAfter.UTC().Format(time.RFC3339))
 }
