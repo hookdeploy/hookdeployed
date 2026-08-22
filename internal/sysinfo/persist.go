@@ -18,14 +18,10 @@ type snapshot struct {
 	LastAttemptUnix int64  `json:"last_attempt_unix,omitempty"`
 }
 
-// StatePath is the non-secret change-detection file. It lives next to the
-// cert directory, not inside it: the cert store is 0700/0600 PKI material
-// (ca.crt, client.crt, client.key, renewal.token). Default layout:
-//
-//	{UserConfigDir}/hookdeploy/certs          ← cert store
-//	{UserConfigDir}/hookdeploy/system-info.json
+// StatePath is the non-secret change-detection file. It lives inside the
+// per-org directory next to org.json (0644), not beside the store root.
 func StatePath(certsDir string) string {
-	return filepath.Join(filepath.Dir(certsDir), "system-info.json")
+	return filepath.Join(certsDir, "system-info.json")
 }
 
 // ClearState removes the change-detection file. Missing is not an error.

@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"path/filepath"
 	"time"
 
 	"github.com/hookdeploy/hookdeployed/internal/enroll"
@@ -32,8 +33,12 @@ const (
 	drainRejectDeadline = 200 * time.Millisecond
 )
 
-// RevokedUserMessage is the jargon-free line logged on reason=revoked.
+// RevokedUserMessage is the jargon-free line logged on reason=revoked
+// when no other orgs remain enrolled.
 const RevokedUserMessage = "this agent was revoked and can no longer connect. Local credentials were removed. Run `agent enroll`, then `agent connect`."
+
+// RevokedOrgMessage is logged when the revoked org was one of several.
+const RevokedOrgMessage = "this organization's credentials were removed. Other organizations are still enrolled. Run `agent switch` to pick one, or `agent enroll` to re-enroll this org."
 
 // Rejection is a terminal server→agent frame. Reason "revoked" deletes
 // credentials; any other reason stops retry without deleting.
@@ -101,8 +106,21 @@ func attemptRenew(cfg Config) {
 	if fn == nil {
 		fn = enroll.MaybeRenew
 	}
-	if err := fn(cfg.EnrollURL, cfg.CertsDir); err != nil {
+	dirs, err := store.ListOrgDirs(cfg.CertsDir)
+	if err != nil {
 		log.Printf("renew skipped/failed: %v", err)
+		return
+	}
+	if len(dirs) == 0 {
+		if err := fn(cfg.EnrollURL, cfg.CertsDir); err != nil {
+			log.Printf("renew skipped/failed: %v", err)
+		}
+		return
+	}
+	for _, dir := range dirs {
+		if err := fn(cfg.EnrollURL, dir); err != nil {
+			log.Printf("renew skipped/failed org=%s: %v", filepath.Base(dir), err)
+		}
 	}
 }
 
@@ -111,7 +129,11 @@ func attemptReport(cfg Config) {
 	if fn == nil {
 		fn = sysinfo.MaybeReport
 	}
-	if err := fn(cfg.EnrollURL, cfg.CertsDir); err != nil {
+	dir, err := store.ResolveActiveDir(cfg.CertsDir)
+	if err != nil {
+		return
+	}
+	if err := fn(cfg.EnrollURL, dir); err != nil {
 		// Non-fatal. Do not log cfg contents — the token lives in the cert dir.
 		log.Printf("system-info report failed: %v", err)
 	}
@@ -129,8 +151,8 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	if _, err := store.Load(cfg.CertsDir); err != nil {
-		return fmt.Errorf("no enrolled cert in %s — run `agent enroll` first", cfg.CertsDir)
+	if _, err := store.ResolveActiveDir(cfg.CertsDir); err != nil {
+		return store.ExplainResolve(cfg.CertsDir, err)
 	}
 
 	backoff := time.Duration(0)
@@ -166,7 +188,11 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error {
-	material, err := store.Load(cfg.CertsDir)
+	orgDir, err := store.ResolveActiveDir(cfg.CertsDir)
+	if err != nil {
+		return fmt.Errorf("reload certs: %w", err)
+	}
+	material, err := store.Load(orgDir)
 	if err != nil {
 		return fmt.Errorf("reload certs: %w", err)
 	}
@@ -298,12 +324,36 @@ func parseReject(line string) (reason string, ok bool) {
 
 func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {
 	if rej.Reason == "revoked" {
-		log.Print(RevokedUserMessage)
-		if err := store.ClearEnrollment(cfg.CertsDir); err != nil {
-			log.Printf("could not finish removing credentials: %v", err)
+		orgID, _ := store.ReadActive(cfg.CertsDir)
+		if orgID == "" {
+			if dir, err := store.ResolveActiveDir(cfg.CertsDir); err == nil {
+				orgID = filepath.Base(dir)
+			}
 		}
-		if err := sysinfo.ClearState(cfg.CertsDir); err != nil {
-			log.Printf("could not clear system-info state: %v", err)
+		others := 0
+		if orgs, err := store.List(cfg.CertsDir); err == nil {
+			for _, o := range orgs {
+				if filepath.Base(o.Dir) != orgID && o.ID != orgID {
+					others++
+				}
+			}
+		}
+		if orgID != "" {
+			if err := store.RemoveOrg(cfg.CertsDir, orgID); err != nil {
+				log.Printf("could not finish removing credentials: %v", err)
+			}
+		} else {
+			if err := store.ClearEnrollment(cfg.CertsDir); err != nil {
+				log.Printf("could not finish removing credentials: %v", err)
+			}
+			if err := sysinfo.ClearState(cfg.CertsDir); err != nil {
+				log.Printf("could not clear system-info state: %v", err)
+			}
+		}
+		if others > 0 {
+			log.Print(RevokedOrgMessage)
+		} else {
+			log.Print(RevokedUserMessage)
 		}
 	} else {
 		log.Printf("this connection was ended (%s). Not retrying. Credentials were kept.", rej.Reason)

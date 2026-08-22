@@ -332,11 +332,19 @@ func TestRunDevicePrintsURLStoresOrgNameAndSucceeds(t *testing.T) {
 	if opened != "https://app.hookdeploy.dev/app/cli-auth/s1" {
 		t.Fatalf("opened=%q", opened)
 	}
-	meta, err := store.LoadOrgMeta(dir)
+	orgDir := store.OrgDir(dir, "org-1")
+	meta, err := store.LoadOrgMeta(orgDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if meta.Name != "Acme Corp" || meta.ID != "org-1" {
 		t.Fatalf("meta=%#v", meta)
+	}
+	if _, err := store.Load(orgDir); err != nil {
+		t.Fatalf("org dir: %v", err)
+	}
+	active, err := store.ReadActive(dir)
+	if err != nil || active != "org-1" {
+		t.Fatalf("active=%q err=%v", active, err)
 	}
 }

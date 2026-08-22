@@ -11,9 +11,8 @@ import (
 
 const OrgMetaFile = "org.json"
 
-// OrgMeta is the display name of the org this store is enrolled into.
-// Not secret — 0644, beside the 0600 cert files. Pass 2 will relocate
-// the whole directory per org.
+// OrgMeta is the display name of the org one per-org directory is enrolled into.
+// Not secret — 0644, beside the 0600 cert files.
 type OrgMeta struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

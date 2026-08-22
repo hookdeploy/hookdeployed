@@ -116,11 +116,8 @@ func runDevice(baseURL, certDir string, io deviceIO) error {
 				agentID = poll.AgentID
 				continue
 			}
-			if err := store.WriteBundle(certDir, []byte(poll.Root), []byte(poll.CertChain), []byte(poll.Certificate), []byte(poll.CA), keyPEM, []byte(poll.RenewalToken)); err != nil {
-				return err
-			}
 			orgName := firstNonEmpty(poll.OrgName, poll.Minted.OrgName)
-			if err := store.WriteOrgMeta(certDir, store.OrgMeta{
+			if err := persistEnrollment(certDir, []byte(poll.Root), []byte(poll.CertChain), []byte(poll.Certificate), []byte(poll.CA), keyPEM, []byte(poll.RenewalToken), store.OrgMeta{
 				ID:   firstNonEmpty(poll.OrgID, poll.Minted.OrgID),
 				Name: orgName,
 				Slug: firstNonEmpty(poll.OrgSlug, poll.Minted.OrgSlug),
@@ -218,14 +215,33 @@ func RunToken(baseURL, token, certDir string) error {
 	if err != nil {
 		return err
 	}
-	if err := store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, []byte(out.RenewalToken)); err != nil {
-		return err
-	}
-	return store.WriteOrgMeta(certDir, store.OrgMeta{
+	return persistEnrollment(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, []byte(out.RenewalToken), store.OrgMeta{
 		ID:   out.OrgID,
 		Name: out.OrgName,
 		Slug: out.OrgSlug,
 	})
+}
+
+func persistEnrollment(root string, rootPEM, certChain, leafPEM, intermediatePEM, keyPEM, renewalToken []byte, meta store.OrgMeta) error {
+	if strings.TrimSpace(meta.ID) == "" {
+		if id, err := store.OrgIDFromCertPEM(leafPEM); err == nil {
+			meta.ID = id
+		}
+	}
+	if strings.TrimSpace(meta.ID) == "" {
+		return fmt.Errorf("enrollment missing org id")
+	}
+	if err := store.EnsureLayout(root); err != nil {
+		return err
+	}
+	orgDir := store.OrgDir(root, meta.ID)
+	if err := store.WriteBundle(orgDir, rootPEM, certChain, leafPEM, intermediatePEM, keyPEM, renewalToken); err != nil {
+		return err
+	}
+	if err := store.WriteOrgMeta(orgDir, meta); err != nil {
+		return err
+	}
+	return store.WriteActive(root, meta.ID)
 }
 
 func localHostname() string {
