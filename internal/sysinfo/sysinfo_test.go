@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -97,7 +96,7 @@ func TestCollectSane(t *testing.T) {
 	}
 }
 
-func TestClearStateRemovesSiblingFile(t *testing.T) {
+func TestClearStateRemovesFileInOrgDir(t *testing.T) {
 	certs := filepath.Join(t.TempDir(), "certs")
 	if err := os.MkdirAll(certs, 0o700); err != nil {
 		t.Fatal(err)
@@ -117,17 +116,14 @@ func TestClearStateRemovesSiblingFile(t *testing.T) {
 	}
 }
 
-func TestStatePathOutsideCertStore(t *testing.T) {
-	certs := filepath.Join(t.TempDir(), "hookdeploy", "certs")
+func TestStatePathInsideOrgDir(t *testing.T) {
+	certs := filepath.Join(t.TempDir(), "hookdeploy", "certs", "org-1")
 	got := StatePath(certs)
 	if filepath.Base(got) != "system-info.json" {
 		t.Fatalf("base=%q", got)
 	}
-	if filepath.Dir(got) != filepath.Dir(certs) {
-		t.Fatalf("state=%q should be sibling of certs=%q", got, certs)
-	}
-	if strings.Contains(got, string(filepath.Separator)+"certs"+string(filepath.Separator)) {
-		t.Fatalf("state must not live inside the cert store: %q", got)
+	if filepath.Dir(got) != certs {
+		t.Fatalf("state=%q should live inside org dir=%q", got, certs)
 	}
 }
 

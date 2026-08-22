@@ -124,6 +124,48 @@ func TestRunMissingCertDir(t *testing.T) {
 	}
 }
 
+func TestRunNoActiveListsOrgsAndAsksToSwitch(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := writeEnrolled(store.OrgDir(root, "org-a"), pki); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEnrolled(store.OrgDir(root, "org-b"), pki); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteOrgMeta(store.OrgDir(root, "org-a"), store.OrgMeta{ID: "org-a", Name: "Alpha", Slug: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteOrgMeta(store.OrgDir(root, "org-b"), store.OrgMeta{ID: "org-b", Name: "Beta", Slug: "beta"}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = Run(context.Background(), Config{
+		Relay:     "relay.example.com",
+		CertsDir:  root,
+		EnrollURL: "http://127.0.0.1:1",
+	})
+	if err == nil {
+		t.Fatal("expected no-active error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "no organization selected") {
+		t.Fatalf("err=%q", msg)
+	}
+	if !strings.Contains(msg, "agent switch") {
+		t.Fatalf("err=%q should tell the user to switch", msg)
+	}
+	if !strings.Contains(msg, "org-a") || !strings.Contains(msg, "org-b") {
+		t.Fatalf("err=%q should list remaining orgs", msg)
+	}
+	if strings.Contains(msg, "agent enroll") {
+		t.Fatalf("must not look unenrolled: %q", msg)
+	}
+}
+
 func TestConnectHandshakeAndTwoPings(t *testing.T) {
 	pki, err := mtls.GenerateTestPKI()
 	if err != nil {
@@ -441,18 +483,16 @@ func TestRevokedDeletesFilesLogsAndStopsRetrying(t *testing.T) {
 	}()
 
 	waitUntil(t, 3*time.Second, func() bool {
-		_, err := store.Load(dir)
-		return err != nil
+		return strings.Contains(logs.String(), RevokedUserMessage)
 	})
-	if !strings.Contains(logs.String(), RevokedUserMessage) {
-		t.Fatalf("missing user message:\n%s", logs.String())
+	if store.LooksEnrolled(dir) {
+		t.Fatal("store still looks enrolled after revoke")
 	}
-	for _, name := range store.EnrollmentFiles {
-		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Fatalf("%s still present", name)
-		}
+	orgDir := store.OrgDir(dir, mtls.TestClientOU)
+	if _, err := os.Stat(orgDir); !os.IsNotExist(err) {
+		t.Fatal("revoked org dir still present")
 	}
-	if _, err := os.Stat(sysinfo.StatePath(dir)); !os.IsNotExist(err) {
+	if _, err := os.Stat(sysinfo.StatePath(orgDir)); !os.IsNotExist(err) {
 		t.Fatal("system-info.json still present")
 	}
 	time.Sleep(150 * time.Millisecond)
@@ -480,6 +520,139 @@ func TestRevokedDeletesFilesLogsAndStopsRetrying(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "run `agent enroll` first") {
 		t.Fatalf("after delete: %v", err)
+	}
+}
+
+func TestRenewAllContinuesAfterOneFailure(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := writeEnrolled(store.OrgDir(root, "org-ok"), pki); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEnrolled(store.OrgDir(root, "org-bad"), pki); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteActive(root, "org-ok"); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var pings atomic.Int32
+	gotTwo := make(chan struct{})
+	go servePings(ln, &pings, gotTwo)
+
+	var mu sync.Mutex
+	seen := map[string]int{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:         ln.Addr().String(),
+			CertsDir:      root,
+			EnrollURL:     "http://127.0.0.1:1",
+			PingInterval:  40 * time.Millisecond,
+			RenewInterval: time.Hour,
+			Renew: func(enrollURL, certDir string) error {
+				mu.Lock()
+				seen[filepath.Base(certDir)]++
+				mu.Unlock()
+				if filepath.Base(certDir) == "org-bad" {
+					return fmt.Errorf("forced org-bad failure")
+				}
+				return nil
+			},
+		})
+	}()
+
+	select {
+	case <-gotTwo:
+	case err := <-errCh:
+		t.Fatalf("connect exited: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out")
+	}
+	cancel()
+	<-errCh
+	mu.Lock()
+	defer mu.Unlock()
+	if seen["org-ok"] < 1 || seen["org-bad"] < 1 {
+		t.Fatalf("renew calls=%v; both orgs must be attempted", seen)
+	}
+}
+
+func TestRevokedRemovesOnlyThatOrgAndClearsActive(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := writeEnrolled(store.OrgDir(root, "org-a"), pki); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEnrolled(store.OrgDir(root, "org-b"), pki); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WriteActive(root, "org-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepts atomic.Int32
+	go serveFrames(ln, `{"type":"reject","reason":"revoked"}`+"\n", &accepts)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:        ln.Addr().String(),
+			CertsDir:     root,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: 40 * time.Millisecond,
+		})
+	}()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		_, err := os.Stat(store.OrgDir(root, "org-a"))
+		return os.IsNotExist(err)
+	})
+	if !strings.Contains(logs.String(), RevokedOrgMessage) {
+		t.Fatalf("missing remaining-orgs message:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), RevokedUserMessage) {
+		t.Fatalf("must not claim wholly unenrolled:\n%s", logs.String())
+	}
+	if _, err := store.Load(store.OrgDir(root, "org-b")); err != nil {
+		t.Fatalf("other org must survive: %v", err)
+	}
+	active, err := store.ReadActive(root)
+	if err != nil || active != "" {
+		t.Fatalf("active should be cleared, got %q err=%v", active, err)
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("dormant cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return")
 	}
 }
 
@@ -518,8 +691,10 @@ func TestUnknownReasonIsTerminalWithoutDelete(t *testing.T) {
 	waitUntil(t, 3*time.Second, func() bool {
 		return strings.Contains(logs.String(), "Credentials were kept")
 	})
-	if _, err := store.Load(dir); err != nil {
-		t.Fatalf("unknown reason must keep credentials: %v", err)
+	if !store.LooksEnrolled(dir) {
+		if _, err := store.ResolveActiveDir(dir); err != nil {
+			t.Fatalf("unknown reason must keep credentials: %v", err)
+		}
 	}
 	time.Sleep(150 * time.Millisecond)
 	if accepts.Load() != 1 {
@@ -567,8 +742,8 @@ func TestUnknownTypeStillRetries(t *testing.T) {
 	}()
 
 	waitUntil(t, 3*time.Second, func() bool { return accepts.Load() >= 2 })
-	if _, err := store.Load(dir); err != nil {
-		t.Fatalf("unknown type must not delete: %v", err)
+	if !store.LooksEnrolled(dir) {
+		t.Fatal("unknown type must not delete")
 	}
 	cancel()
 	select {

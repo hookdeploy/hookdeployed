@@ -37,6 +37,20 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "list" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		if err := runList(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "switch" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		if err := runSwitch(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	runEcho()
 }
 
@@ -82,8 +96,39 @@ func runConnect() error {
 	})
 }
 
+func runList() error {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	orgs, err := store.List(*dir)
+	if err != nil {
+		return err
+	}
+	if len(orgs) == 0 {
+		return fmt.Errorf("no enrolled organizations — run `agent enroll`")
+	}
+	fmt.Print(store.FormatList(orgs))
+	return nil
+}
+
+func runSwitch() error {
+	fs := flag.NewFlagSet("switch", flag.ExitOnError)
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	tty := enroll.RequireInteractiveFile(os.Stdin) == nil
+	return store.RunSwitch(*dir, fs.Args(), os.Stdin, os.Stdout, tty)
+}
+
 func confirmStore(dir string) error {
-	material, err := store.Load(dir)
+	orgDir, err := store.ResolveActiveDir(dir)
+	if err != nil {
+		return store.ExplainResolve(dir, err)
+	}
+	material, err := store.Load(orgDir)
 	if err != nil {
 		return err
 	}
@@ -92,10 +137,10 @@ func confirmStore(dir string) error {
 	if len(material.ClientCert.Subject.OrganizationalUnit) > 0 {
 		ou = material.ClientCert.Subject.OrganizationalUnit[0]
 	}
-	if meta, err := store.LoadOrgMeta(dir); err == nil && meta.Name != "" {
-		log.Printf("stored cert in %s org=%s CN=%s OU=%s", dir, meta.Name, cn, ou)
+	if meta, err := store.LoadOrgMeta(orgDir); err == nil && meta.Name != "" {
+		log.Printf("stored cert in %s org=%s CN=%s OU=%s", orgDir, meta.Name, cn, ou)
 	} else {
-		log.Printf("stored cert in %s CN=%s OU=%s", dir, cn, ou)
+		log.Printf("stored cert in %s CN=%s OU=%s", orgDir, cn, ou)
 	}
 	if cn == "" || ou == "" {
 		return fmt.Errorf("enrolled cert missing CN or OU — relay will reject")
