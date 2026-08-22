@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/hookdeploy/hookdeployed/internal/connect"
@@ -47,6 +48,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "switch" {
 		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
 		if err := runSwitch(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "unenroll" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		if err := runUnenroll(); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -111,6 +119,26 @@ func runList() error {
 	}
 	fmt.Print(store.FormatList(orgs))
 	return nil
+}
+
+func runUnenroll() error {
+	fs := flag.NewFlagSet("unenroll", flag.ExitOnError)
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker for self-revoke")
+	localOnly := fs.Bool("local-only", false, "delete local credentials without revoking the agent")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	tty := enroll.RequireInteractiveFile(os.Stdin) == nil
+	query := strings.Join(fs.Args(), " ")
+	return enroll.Unenroll(enroll.UnenrollConfig{
+		Root:      *dir,
+		EnrollURL: *enrollURL,
+		LocalOnly: *localOnly,
+		Yes:       *yes,
+		Query:     query,
+	}, os.Stdin, os.Stdout, tty)
 }
 
 func runSwitch() error {
