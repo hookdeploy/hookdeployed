@@ -143,6 +143,16 @@ func (c *Client) Renew(certificatePEM, intermediatePEM, rootPEM, csrPEM []byte) 
 	return &out, nil
 }
 
+func (c *Client) SelfRevoke(renewalToken string) error {
+	var out struct {
+		OK      bool   `json:"ok"`
+		AgentID string `json:"agent_id"`
+	}
+	return c.post("/v1/agents/self-revoke", map[string]string{
+		"renewal_token": renewalToken,
+	}, &out)
+}
+
 func (c *Client) RenewWithToken(renewalToken string, csrPEM []byte) (*TokenResponse, error) {
 	var out TokenResponse
 	if err := c.post("/v1/enroll/renew", map[string]string{
