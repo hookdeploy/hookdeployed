@@ -802,3 +802,221 @@ func waitUntil(t *testing.T, d time.Duration, ok func() bool) {
 	}
 	t.Fatalf("timed out after %s", d)
 }
+
+func TestDecideDialSourceRelayWins(t *testing.T) {
+	src := DecideDialSource("relay-us-east-01.hookdeploy.dev:9443", "us-west")
+	if src.Pin == "" || src.RequestedRegion != "" || !src.RegionIgnored {
+		t.Fatalf("%+v", src)
+	}
+	auto := DecideDialSource("", "us-east")
+	if auto.Pin != "" || auto.RequestedRegion != "us-east" || auto.RegionIgnored {
+		t.Fatalf("%+v", auto)
+	}
+	neither := DecideDialSource("", "")
+	if neither.Pin != "" || neither.RequestedRegion != "" {
+		t.Fatalf("%+v", neither)
+	}
+}
+
+func TestRelayPinDoesNotCallPlacement(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var pings atomic.Int32
+	gotTwo := make(chan struct{})
+	go servePings(ln, &pings, gotTwo)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:           ln.Addr().String(),
+			RequestedRegion: "us-west",
+			CertsDir:        dir,
+			EnrollURL:       "http://127.0.0.1:1",
+			PingInterval:    40 * time.Millisecond,
+			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+				t.Error("placement must not run when --relay is set")
+				return nil, fmt.Errorf("placement must not run")
+			},
+		})
+	}()
+	select {
+	case <-gotTwo:
+	case err := <-errCh:
+		t.Fatalf("connect exited: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out")
+	}
+	cancel()
+	<-errCh
+}
+
+func TestNeitherFlagAsksPlacement(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var pings atomic.Int32
+	gotTwo := make(chan struct{})
+	go servePings(ln, &pings, gotTwo)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	var calls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	warning := "Connecting to us-east. This organization is EU-resident. Payloads are not logged or stored on relay nodes, but traffic will transit outside the EU."
+	go func() {
+		errCh <- Run(ctx, Config{
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: 40 * time.Millisecond,
+			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+				calls.Add(1)
+				if token == "" {
+					t.Error("missing token")
+				}
+				return &enroll.PlacementResult{
+					Hostname:  ln.Addr().String(),
+					RegionKey: "us-east",
+					Warning:   warning,
+				}, nil
+			},
+		})
+	}()
+	select {
+	case <-gotTwo:
+	case err := <-errCh:
+		t.Fatalf("connect exited: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out")
+	}
+	if calls.Load() < 1 {
+		t.Fatal("placement was not asked")
+	}
+	out := logs.String()
+	if !strings.Contains(out, "assigned region=us-east") {
+		t.Fatalf("missing assigned line: %s", out)
+	}
+	if !strings.Contains(out, warning) {
+		t.Fatalf("missing EU warning: %s", out)
+	}
+	cancel()
+	<-errCh
+}
+
+func TestPlacementReaskedOnRetry(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var pings atomic.Int32
+	gotTwo := make(chan struct{})
+	go servePings(ln, &pings, gotTwo)
+
+	var calls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			RequestedRegion: "us-east",
+			CertsDir:        dir,
+			EnrollURL:       "http://127.0.0.1:1",
+			PingInterval:    40 * time.Millisecond,
+			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+				n := calls.Add(1)
+				if region != "us-east" {
+					t.Errorf("region=%q", region)
+				}
+				if n == 1 {
+					return &enroll.PlacementResult{Hostname: "127.0.0.1:1", RegionKey: "us-east"}, nil
+				}
+				return &enroll.PlacementResult{Hostname: ln.Addr().String(), RegionKey: "us-west"}, nil
+			},
+		})
+	}()
+	select {
+	case <-gotTwo:
+	case err := <-errCh:
+		t.Fatalf("connect exited: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for retry placement")
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("place calls=%d want >= 2", calls.Load())
+	}
+	cancel()
+	<-errCh
+}
+
+func TestPlacementFailureBacksOffWithoutCrashing(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	var calls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: 40 * time.Millisecond,
+			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+				calls.Add(1)
+				return nil, fmt.Errorf("no healthy relay is available")
+			},
+		})
+	}()
+	waitUntil(t, 4*time.Second, func() bool {
+		return calls.Load() >= 2 && strings.Contains(logs.String(), "placement failed: no healthy relay is available")
+	})
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
