@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -139,6 +140,28 @@ func (c *Client) Renew(certificatePEM, intermediatePEM, rootPEM, csrPEM []byte) 
 		"csr":         string(csrPEM),
 	}, &out); err != nil {
 		return nil, err
+	}
+	return &out, nil
+}
+
+type PlacementResult struct {
+	Hostname  string `json:"hostname"`
+	RegionKey string `json:"region_key"`
+	Reason    string `json:"reason"`
+	Warning   string `json:"warning"`
+}
+
+func (c *Client) Placement(renewalToken, region string) (*PlacementResult, error) {
+	body := map[string]string{"renewal_token": renewalToken}
+	if region != "" {
+		body["region"] = region
+	}
+	var out PlacementResult
+	if err := c.post("/v1/agents/placement", body, &out); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(out.Hostname) == "" {
+		return nil, fmt.Errorf("placement response missing hostname")
 	}
 	return &out, nil
 }

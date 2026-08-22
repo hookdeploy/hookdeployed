@@ -84,23 +84,26 @@ func runEnroll() error {
 
 func runConnect() error {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
-	relay := fs.String("relay", "", "relay host or host:port (default port 9443)")
+	relay := fs.String("relay", "", "pin a specific relay host or host:port (default port 9443)")
+	region := fs.String("region", "", "request a relay region (e.g. us-east); ignored when --relay is set")
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory (0600 files)")
-	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker for renewal")
+	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker for renewal and placement")
 	interval := fs.Duration("ping-interval", connect.DefaultPingInterval, "PING interval")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
-	if *relay == "" {
-		return fmt.Errorf("--relay is required")
+	src := connect.DecideDialSource(*relay, *region)
+	if src.RegionIgnored {
+		log.Printf("--region %s ignored; --relay pins this instance", *region)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return connect.Run(ctx, connect.Config{
-		Relay:        *relay,
-		CertsDir:     *dir,
-		EnrollURL:    *enrollURL,
-		PingInterval: *interval,
+		Relay:           src.Pin,
+		RequestedRegion: src.RequestedRegion,
+		CertsDir:        *dir,
+		EnrollURL:       *enrollURL,
+		PingInterval:    *interval,
 	})
 }
 

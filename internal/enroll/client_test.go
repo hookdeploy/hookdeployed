@@ -175,3 +175,30 @@ func TestClientRenewPostsCertificate(t *testing.T) {
 		t.Fatal("leaf renew must not send renewal_token")
 	}
 }
+
+func TestPlacementPostsTokenAndRegion(t *testing.T) {
+	var got map[string]string
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"hostname":"relay-us-east-01.hookdeploy.dev","region_key":"us-east","reason":"requested"}`))
+	}))
+	defer srv.Close()
+
+	out, err := NewClient(srv.URL).Placement("hd_agentrenew_us_tok", "us-east")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/v1/agents/placement" {
+		t.Fatalf("path=%q", path)
+	}
+	if got["renewal_token"] != "hd_agentrenew_us_tok" || got["region"] != "us-east" {
+		t.Fatalf("body=%#v", got)
+	}
+	if out.Hostname != "relay-us-east-01.hookdeploy.dev" || out.RegionKey != "us-east" {
+		t.Fatalf("%+v", out)
+	}
+}

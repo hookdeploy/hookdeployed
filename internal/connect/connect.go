@@ -10,7 +10,9 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hookdeploy/hookdeployed/internal/enroll"
@@ -54,15 +56,79 @@ func (e Rejection) Error() string {
 }
 
 type Config struct {
-	Relay         string
-	CertsDir      string
-	EnrollURL     string
-	PingInterval  time.Duration
-	RenewInterval time.Duration
+	Relay           string
+	RequestedRegion string
+	CertsDir        string
+	EnrollURL       string
+	PingInterval    time.Duration
+	RenewInterval   time.Duration
 	// Renew overrides enroll.MaybeRenew (tests). Nil uses the real function.
 	Renew func(enrollURL, certDir string) error
 	// Report overrides sysinfo.MaybeReport (tests). Nil uses the real function.
 	Report func(enrollURL, certDir string) error
+	// Place overrides enrollment placement (tests). Nil uses enroll.Client.Placement.
+	Place func(enrollURL, token, region string) (*enroll.PlacementResult, error)
+}
+
+// DialSource is how connect decides pin vs placement.
+type DialSource struct {
+	Pin             string
+	RequestedRegion string
+	RegionIgnored   bool
+}
+
+// DecideDialSource: --relay wins and ignores --region; neither means auto-place.
+func DecideDialSource(relay, region string) DialSource {
+	if relay != "" {
+		return DialSource{Pin: relay, RegionIgnored: region != ""}
+	}
+	return DialSource{RequestedRegion: region}
+}
+
+func resolveDial(cfg Config) (host, addr string, err error) {
+	if cfg.Relay != "" {
+		return ParseRelay(cfg.Relay)
+	}
+	placed, err := fetchPlacement(cfg)
+	if err != nil {
+		return "", "", err
+	}
+	return ParseRelay(placed.Hostname)
+}
+
+func fetchPlacement(cfg Config) (*enroll.PlacementResult, error) {
+	orgDir, err := store.ResolveActiveDir(cfg.CertsDir)
+	if err != nil {
+		return nil, store.ExplainResolve(cfg.CertsDir, err)
+	}
+	material, err := store.Load(orgDir)
+	if err != nil {
+		return nil, fmt.Errorf("load certs: %w", err)
+	}
+	token := strings.TrimSpace(material.RenewalToken)
+	if token == "" {
+		return nil, fmt.Errorf("no renewal token — run `agent enroll` or pass --relay")
+	}
+	fn := cfg.Place
+	if fn == nil {
+		client := &enroll.Client{
+			BaseURL:    strings.TrimRight(cfg.EnrollURL, "/"),
+			HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		}
+		fn = func(enrollURL, renewalToken, region string) (*enroll.PlacementResult, error) {
+			_ = enrollURL
+			return client.Placement(renewalToken, region)
+		}
+	}
+	result, err := fn(cfg.EnrollURL, token, cfg.RequestedRegion)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("assigned region=%s hostname=%s", result.RegionKey, result.Hostname)
+	if result.Warning != "" {
+		log.Print(result.Warning)
+	}
+	return result, nil
 }
 
 func ParseRelay(relay string) (host, addr string, err error) {
@@ -146,11 +212,6 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.RenewInterval <= 0 {
 		cfg.RenewInterval = DefaultRenewInterval
 	}
-	host, addr, err := ParseRelay(cfg.Relay)
-	if err != nil {
-		return err
-	}
-
 	if _, err := store.ResolveActiveDir(cfg.CertsDir); err != nil {
 		return store.ExplainResolve(cfg.CertsDir, err)
 	}
@@ -164,8 +225,23 @@ func Run(ctx context.Context, cfg Config) error {
 		// disk. A 401 from a just-rotated token is non-fatal; the next
 		// connect retries after this iteration's MaybeRenew writes the new
 		// token. Do not add a rotation grace window.
+		// Placement runs after renew so the token we send is the one on disk.
 		attemptReport(cfg)
 		attemptRenew(cfg)
+		host, addr, err := resolveDial(cfg)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			backoff = NextBackoff(backoff)
+			log.Printf("placement failed: %v; retry in %s", err, backoff)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			continue
+		}
 		if err := dialAndHeartbeat(ctx, cfg, host, addr); err != nil {
 			if ctx.Err() != nil {
 				return nil
