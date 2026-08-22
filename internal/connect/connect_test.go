@@ -670,7 +670,7 @@ func TestUnknownReasonIsTerminalWithoutDelete(t *testing.T) {
 	}
 	defer ln.Close()
 	var accepts atomic.Int32
-	go serveFrames(ln, `{"type":"reject","reason":"draining"}`+"\n", &accepts)
+	go serveFrames(ln, `{"type":"reject","reason":"nope"}`+"\n", &accepts)
 
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
@@ -705,6 +705,64 @@ func TestUnknownReasonIsTerminalWithoutDelete(t *testing.T) {
 	case err := <-errCh:
 		if err != nil {
 			t.Fatalf("dormant cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
+func TestDrainingReplacesWithoutDelete(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepts atomic.Int32
+	go serveFrames(ln, `{"type":"reject","reason":"draining"}`+"\n", &accepts)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	var places atomic.Int32
+	go func() {
+		errCh <- Run(ctx, Config{
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: 40 * time.Millisecond,
+			Place: func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error) {
+				places.Add(1)
+				return &enroll.PlacementResult{Hostname: ln.Addr().String(), RegionKey: "us-east"}, nil
+			},
+		})
+	}()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		return strings.Contains(logs.String(), DrainingUserMessage) && accepts.Load() >= 2
+	})
+	if !store.LooksEnrolled(dir) {
+		if _, err := store.ResolveActiveDir(dir); err != nil {
+			t.Fatalf("draining must keep credentials: %v", err)
+		}
+	}
+	if places.Load() < 2 {
+		t.Fatalf("draining must re-place: places=%d", places.Load())
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("draining cancel: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after ctx cancel")
