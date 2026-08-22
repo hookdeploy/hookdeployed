@@ -51,3 +51,23 @@ func Write(dir string, caPEM, certPEM, keyPEM []byte) error {
 func Load(dir string) (*mtls.ClientMaterial, error) {
 	return mtls.LoadClientDir(dir)
 }
+
+// EnrollmentFiles is the cert-store set that makes an agent enrolled.
+// ClearEnrollment deletes them in this order: client.key first so a
+// partial failure cannot leave a usable identity (no private key).
+var EnrollmentFiles = []string{"client.key", "client.crt", "renewal.token", "ca.crt"}
+
+// ClearEnrollment removes every enrollment file. client.key is removed
+// first: without the private key the remaining files are inert.
+// Missing files are ignored. The first real remove error is returned
+// after the remaining names are still attempted.
+func ClearEnrollment(dir string) error {
+	var first error
+	for _, name := range EnrollmentFiles {
+		err := os.Remove(filepath.Join(dir, name))
+		if err != nil && !os.IsNotExist(err) && first == nil {
+			first = err
+		}
+	}
+	return first
+}
