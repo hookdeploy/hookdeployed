@@ -805,16 +805,82 @@ func waitUntil(t *testing.T, d time.Duration, ok func() bool) {
 
 func TestDecideDialSourceRelayWins(t *testing.T) {
 	src := DecideDialSource("relay-us-east-01.hookdeploy.dev:9443", "us-west")
-	if src.Pin == "" || src.RequestedRegion != "" || !src.RegionIgnored {
+	if src.Pin == "" || src.RequestedRegion != "" || !src.RelayWins {
 		t.Fatalf("%+v", src)
 	}
 	auto := DecideDialSource("", "us-east")
-	if auto.Pin != "" || auto.RequestedRegion != "us-east" || auto.RegionIgnored {
+	if auto.Pin != "" || auto.RequestedRegion != "us-east" || auto.RelayWins {
 		t.Fatalf("%+v", auto)
 	}
 	neither := DecideDialSource("", "")
 	if neither.Pin != "" || neither.RequestedRegion != "" {
 		t.Fatalf("%+v", neither)
+	}
+}
+
+func TestParseConnectFlags(t *testing.T) {
+	ok, err := ParseConnectFlags("", "us-west", false, "eu-central,eu-west,eu-central")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok.RequestedRegion != "us-west" || ok.Enforce || len(ok.Fallback) != 2 {
+		t.Fatalf("%+v", ok)
+	}
+	if ok.Fallback[0] != "eu-central" || ok.Fallback[1] != "eu-west" {
+		t.Fatalf("order/dedupe %+v", ok.Fallback)
+	}
+
+	_, err = ParseConnectFlags("", "us-west", true, "eu-west")
+	if err == nil || !strings.Contains(err.Error(), errEnforceWithFallback) {
+		t.Fatalf("enforce+fallback: %v", err)
+	}
+	_, err = ParseConnectFlags("", "", false, "eu-west")
+	if err == nil || !strings.Contains(err.Error(), errFallbackWithoutRegion) {
+		t.Fatalf("fallback without region: %v", err)
+	}
+	_, err = ParseConnectFlags("", "us-west", false, "ap-south")
+	if err == nil || !strings.Contains(err.Error(), "ap-south") {
+		t.Fatalf("unknown fallback: %v", err)
+	}
+
+	pin, err := ParseConnectFlags("relay-us-east-01.hookdeploy.dev", "us-west", true, "eu-west")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pin.Pin == "" || !pin.RelayWins || pin.RequestedRegion != "" || pin.Enforce || len(pin.Fallback) != 0 {
+		t.Fatalf("relay must drop placement flags: %+v", pin)
+	}
+}
+
+func TestFormatAssignmentAndEnforce(t *testing.T) {
+	chain := FormatAssignment(&enroll.PlacementResult{
+		Hostname:        "relay-us-west-01.hookdeploy.dev",
+		RegionKey:       "us-west",
+		Reason:          "requested_unavailable",
+		RequestedRegion: "us-east",
+	})
+	if chain != "us-east has no healthy relay; assigned region=us-west hostname=relay-us-west-01.hookdeploy.dev" {
+		t.Fatalf("chain: %s", chain)
+	}
+	explicit := FormatAssignment(&enroll.PlacementResult{
+		Hostname:        "relay-eu-central-01.hookdeploy.dev",
+		RegionKey:       "eu-central",
+		Reason:          "explicit_fallback",
+		RequestedRegion: "us-east",
+	})
+	if explicit != "us-east has no healthy relay; assigned from --fallback region=eu-central hostname=relay-eu-central-01.hookdeploy.dev" {
+		t.Fatalf("explicit: %s", explicit)
+	}
+	direct := FormatAssignment(&enroll.PlacementResult{
+		Hostname:  "relay-us-east-01.hookdeploy.dev",
+		RegionKey: "us-east",
+		Reason:    "requested",
+	})
+	if direct != "assigned region=us-east hostname=relay-us-east-01.hookdeploy.dev" {
+		t.Fatalf("direct: %s", direct)
+	}
+	if got := FormatEnforcedUnavailable("us-west"); got != "enforced region us-west has no healthy relay (--enforce)" {
+		t.Fatalf("enforce: %s", got)
 	}
 }
 
@@ -845,7 +911,7 @@ func TestRelayPinDoesNotCallPlacement(t *testing.T) {
 			CertsDir:        dir,
 			EnrollURL:       "http://127.0.0.1:1",
 			PingInterval:    40 * time.Millisecond,
-			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+			Place: func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error) {
 				t.Error("placement must not run when --relay is set")
 				return nil, fmt.Errorf("placement must not run")
 			},
@@ -893,7 +959,7 @@ func TestNeitherFlagAsksPlacement(t *testing.T) {
 			CertsDir:     dir,
 			EnrollURL:    "http://127.0.0.1:1",
 			PingInterval: 40 * time.Millisecond,
-			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+			Place: func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error) {
 				calls.Add(1)
 				if token == "" {
 					t.Error("missing token")
@@ -954,10 +1020,10 @@ func TestPlacementReaskedOnRetry(t *testing.T) {
 			CertsDir:        dir,
 			EnrollURL:       "http://127.0.0.1:1",
 			PingInterval:    40 * time.Millisecond,
-			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+			Place: func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error) {
 				n := calls.Add(1)
-				if region != "us-east" {
-					t.Errorf("region=%q", region)
+				if opts.Region != "us-east" {
+					t.Errorf("region=%q", opts.Region)
 				}
 				if n == 1 {
 					return &enroll.PlacementResult{Hostname: "127.0.0.1:1", RegionKey: "us-east"}, nil
@@ -1001,7 +1067,7 @@ func TestPlacementFailureBacksOffWithoutCrashing(t *testing.T) {
 			CertsDir:     dir,
 			EnrollURL:    "http://127.0.0.1:1",
 			PingInterval: 40 * time.Millisecond,
-			Place: func(enrollURL, token, region string) (*enroll.PlacementResult, error) {
+			Place: func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error) {
 				calls.Add(1)
 				return nil, fmt.Errorf("no healthy relay is available")
 			},
@@ -1009,6 +1075,53 @@ func TestPlacementFailureBacksOffWithoutCrashing(t *testing.T) {
 	}()
 	waitUntil(t, 4*time.Second, func() bool {
 		return calls.Load() >= 2 && strings.Contains(logs.String(), "placement failed: no healthy relay is available")
+	})
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestEnforcedUnavailableBacksOffWithoutExiting(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	var calls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			RequestedRegion: "us-west",
+			Enforce:         true,
+			CertsDir:        dir,
+			EnrollURL:       "http://127.0.0.1:1",
+			PingInterval:    40 * time.Millisecond,
+			Place: func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error) {
+				calls.Add(1)
+				if !opts.Enforce || opts.Region != "us-west" {
+					t.Errorf("opts=%+v", opts)
+				}
+				return nil, &enroll.APIError{Status: 503, Code: "enforced_region_unavailable", Message: "enforced region us-west has no healthy relay"}
+			},
+		})
+	}()
+	want := "placement failed: enforced region us-west has no healthy relay (--enforce)"
+	waitUntil(t, 4*time.Second, func() bool {
+		return calls.Load() >= 2 && strings.Contains(logs.String(), want)
 	})
 	cancel()
 	select {

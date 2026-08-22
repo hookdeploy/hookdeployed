@@ -58,6 +58,8 @@ func (e Rejection) Error() string {
 type Config struct {
 	Relay           string
 	RequestedRegion string
+	Enforce         bool
+	Fallback        []string
 	CertsDir        string
 	EnrollURL       string
 	PingInterval    time.Duration
@@ -67,22 +69,117 @@ type Config struct {
 	// Report overrides sysinfo.MaybeReport (tests). Nil uses the real function.
 	Report func(enrollURL, certDir string) error
 	// Place overrides enrollment placement (tests). Nil uses enroll.Client.Placement.
-	Place func(enrollURL, token, region string) (*enroll.PlacementResult, error)
+	Place func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error)
 }
 
 // DialSource is how connect decides pin vs placement.
 type DialSource struct {
 	Pin             string
 	RequestedRegion string
-	RegionIgnored   bool
+	Enforce         bool
+	Fallback        []string
+	RelayWins       bool
+}
+
+// RelayPinPrecedenceMessage is logged when --relay is set with any placement flags.
+const RelayPinPrecedenceMessage = "--relay pins this instance; --region, --enforce, and --fallback are ignored"
+
+const (
+	errEnforceWithFallback   = "--enforce and --fallback cannot be used together"
+	errFallbackWithoutRegion = "--fallback requires --region"
+)
+
+var knownRelayRegions = map[string]struct{}{
+	"us-west": {}, "us-east": {}, "uk-london": {},
+	"eu-west": {}, "eu-central": {}, "ap-southeast": {}, "au-southeast": {},
+}
+
+// ParseConnectFlags: --relay wins over --region / --enforce / --fallback.
+// --enforce + --fallback is an error. --fallback without --region is an error.
+func ParseConnectFlags(relay, region string, enforce bool, fallbackRaw string) (DialSource, error) {
+	if relay != "" {
+		ignored := region != "" || enforce || strings.TrimSpace(fallbackRaw) != ""
+		return DialSource{Pin: relay, RelayWins: ignored}, nil
+	}
+	fallback, err := parseFallbackList(fallbackRaw)
+	if err != nil {
+		return DialSource{}, err
+	}
+	if enforce && len(fallback) > 0 {
+		return DialSource{}, fmt.Errorf("%s", errEnforceWithFallback)
+	}
+	if len(fallback) > 0 && region == "" {
+		return DialSource{}, fmt.Errorf("%s", errFallbackWithoutRegion)
+	}
+	if region != "" {
+		if _, ok := knownRelayRegions[region]; !ok {
+			return DialSource{}, fmt.Errorf("--region %q is not a known relay region", region)
+		}
+	}
+	if enforce && region == "" {
+		return DialSource{}, fmt.Errorf("--enforce requires --region")
+	}
+	return DialSource{RequestedRegion: region, Enforce: enforce, Fallback: fallback}, nil
+}
+
+func parseFallbackList(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		region := strings.TrimSpace(part)
+		if region == "" {
+			continue
+		}
+		if _, ok := knownRelayRegions[region]; !ok {
+			return nil, fmt.Errorf("--fallback region %q is not a known relay region", region)
+		}
+		if _, dup := seen[region]; dup {
+			continue
+		}
+		seen[region] = struct{}{}
+		out = append(out, region)
+	}
+	return out, nil
 }
 
 // DecideDialSource: --relay wins and ignores --region; neither means auto-place.
 func DecideDialSource(relay, region string) DialSource {
-	if relay != "" {
-		return DialSource{Pin: relay, RegionIgnored: region != ""}
+	src, err := ParseConnectFlags(relay, region, false, "")
+	if err != nil {
+		return DialSource{RequestedRegion: region}
 	}
-	return DialSource{RequestedRegion: region}
+	return src
+}
+
+// FormatAssignment is the connect log line after a successful placement.
+func FormatAssignment(result *enroll.PlacementResult) string {
+	requested := strings.TrimSpace(result.RequestedRegion)
+	if requested != "" && requested != result.RegionKey {
+		switch result.Reason {
+		case "explicit_fallback":
+			return fmt.Sprintf(
+				"%s has no healthy relay; assigned from --fallback region=%s hostname=%s",
+				requested, result.RegionKey, result.Hostname,
+			)
+		case "requested_unavailable":
+			return fmt.Sprintf(
+				"%s has no healthy relay; assigned region=%s hostname=%s",
+				requested, result.RegionKey, result.Hostname,
+			)
+		}
+	}
+	return fmt.Sprintf("assigned region=%s hostname=%s", result.RegionKey, result.Hostname)
+}
+
+func FormatEnforcedUnavailable(region string) string {
+	if strings.TrimSpace(region) == "" {
+		region = "the requested region"
+	}
+	return fmt.Sprintf("enforced region %s has no healthy relay (--enforce)", region)
 }
 
 func resolveDial(cfg Config) (host, addr string, err error) {
@@ -115,16 +212,23 @@ func fetchPlacement(cfg Config) (*enroll.PlacementResult, error) {
 			BaseURL:    strings.TrimRight(cfg.EnrollURL, "/"),
 			HTTPClient: &http.Client{Timeout: 10 * time.Second},
 		}
-		fn = func(enrollURL, renewalToken, region string) (*enroll.PlacementResult, error) {
+		fn = func(enrollURL, renewalToken string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error) {
 			_ = enrollURL
-			return client.Placement(renewalToken, region)
+			return client.Placement(renewalToken, opts)
 		}
 	}
-	result, err := fn(cfg.EnrollURL, token, cfg.RequestedRegion)
+	result, err := fn(cfg.EnrollURL, token, enroll.PlacementOptions{
+		Region:   cfg.RequestedRegion,
+		Enforce:  cfg.Enforce,
+		Fallback: cfg.Fallback,
+	})
 	if err != nil {
+		if enroll.IsEnforcedUnavailable(err) {
+			return nil, fmt.Errorf("%s", FormatEnforcedUnavailable(cfg.RequestedRegion))
+		}
 		return nil, err
 	}
-	log.Printf("assigned region=%s hostname=%s", result.RegionKey, result.Hostname)
+	log.Print(FormatAssignment(result))
 	if result.Warning != "" {
 		log.Print(result.Warning)
 	}
