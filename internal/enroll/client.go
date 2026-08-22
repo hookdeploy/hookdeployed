@@ -54,11 +54,13 @@ type TokenResponse struct {
 	Minted
 }
 
-func (c *Client) DeviceStart(orgHint string) (*StartResponse, error) {
+func (c *Client) DeviceStart(orgHint, hostname string) (*StartResponse, error) {
+	body := map[string]string{"org_hint": orgHint}
+	if hostname != "" {
+		body["hostname"] = hostname
+	}
 	var out StartResponse
-	if err := c.post("/v1/enroll/device/start", map[string]string{
-		"org_hint": orgHint,
-	}, &out); err != nil {
+	if err := c.post("/v1/enroll/device/start", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -76,22 +78,28 @@ func (c *Client) DevicePoll(deviceCode string, csrPEM []byte) (*PollResponse, er
 	return &out, nil
 }
 
-func (c *Client) TokenStart(token string) (*TokenResponse, error) {
+func (c *Client) TokenStart(token, hostname string) (*TokenResponse, error) {
+	body := map[string]string{"token": token}
+	if hostname != "" {
+		body["hostname"] = hostname
+	}
 	var out TokenResponse
-	if err := c.post("/v1/enroll/token", map[string]string{
-		"token": token,
-	}, &out); err != nil {
+	if err := c.post("/v1/enroll/token", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-func (c *Client) TokenComplete(token string, csrPEM []byte) (*TokenResponse, error) {
-	var out TokenResponse
-	if err := c.post("/v1/enroll/token", map[string]string{
+func (c *Client) TokenComplete(token string, csrPEM []byte, hostname string) (*TokenResponse, error) {
+	body := map[string]string{
 		"token": token,
 		"csr":   string(csrPEM),
-	}, &out); err != nil {
+	}
+	if hostname != "" {
+		body["hostname"] = hostname
+	}
+	var out TokenResponse
+	if err := c.post("/v1/enroll/token", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

@@ -19,7 +19,7 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 		return err
 	}
 	client := NewClient(baseURL)
-	start, err := client.DeviceStart(orgHint)
+	start, err := client.DeviceStart(orgHint, localHostname())
 	if err != nil {
 		return err
 	}
@@ -78,7 +78,8 @@ func RunToken(baseURL, token, certDir string) error {
 		return err
 	}
 	client := NewClient(baseURL)
-	started, err := client.TokenStart(token)
+	host := localHostname()
+	started, err := client.TokenStart(token, host)
 	if err != nil {
 		return err
 	}
@@ -89,7 +90,7 @@ func RunToken(baseURL, token, certDir string) error {
 	if err != nil {
 		return err
 	}
-	out, err := client.TokenComplete(token, csrPEM)
+	out, err := client.TokenComplete(token, csrPEM, host)
 	if err != nil {
 		return err
 	}
@@ -98,6 +99,14 @@ func RunToken(baseURL, token, certDir string) error {
 
 // ShouldRenew reports whether MaybeRenew should hit the network.
 // Past halfway of a healthy leaf, OR the leaf is expired / not yet valid.
+func localHostname() string {
+	host, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(host)
+}
+
 func ShouldRenew(cert *x509.Certificate, now time.Time) bool {
 	if cert == nil {
 		return false
