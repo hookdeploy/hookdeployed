@@ -97,6 +97,26 @@ func TestCollectSane(t *testing.T) {
 	}
 }
 
+func TestClearStateRemovesSiblingFile(t *testing.T) {
+	certs := filepath.Join(t.TempDir(), "certs")
+	if err := os.MkdirAll(certs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := StatePath(certs)
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearState(certs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("state still present: %v", err)
+	}
+	if err := ClearState(certs); err != nil {
+		t.Fatalf("missing state must not error: %v", err)
+	}
+}
+
 func TestStatePathOutsideCertStore(t *testing.T) {
 	certs := filepath.Join(t.TempDir(), "hookdeploy", "certs")
 	got := StatePath(certs)

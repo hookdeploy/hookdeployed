@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,7 +27,26 @@ const (
 	DefaultRenewInterval = 5 * time.Minute
 	maxBackoff           = 30 * time.Second
 	minBackoff           = time.Second
+	// drainRejectDeadline is how long pingOnce waits for a reject frame
+	// after a PING write fails (the relay may have written then closed).
+	drainRejectDeadline = 200 * time.Millisecond
 )
+
+// RevokedUserMessage is the jargon-free line logged on reason=revoked.
+const RevokedUserMessage = "this agent was revoked and can no longer connect. Local credentials were removed. Run `agent enroll`, then `agent connect`."
+
+// Rejection is a terminal server→agent frame. Reason "revoked" deletes
+// credentials; any other reason stops retry without deleting.
+type Rejection struct {
+	Reason string
+}
+
+func (e Rejection) Error() string {
+	if e.Reason == "" {
+		return "rejected"
+	}
+	return "rejected: " + e.Reason
+}
 
 type Config struct {
 	Relay         string
@@ -127,6 +148,10 @@ func Run(ctx context.Context, cfg Config) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			var rej Rejection
+			if errors.As(err, &rej) {
+				return settleRejection(ctx, cfg, rej)
+			}
 			backoff = NextBackoff(backoff)
 			log.Printf("disconnected relay=%s; retry in %s", host, backoff)
 			select {
@@ -177,7 +202,9 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		log.Printf("heartbeat dropped relay=%s", host)
+		if _, ok := err.(Rejection); !ok {
+			log.Printf("heartbeat dropped relay=%s", host)
+		}
 		return err
 	}
 
@@ -201,7 +228,9 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				log.Printf("heartbeat dropped relay=%s", host)
+				if _, ok := err.(Rejection); !ok {
+					log.Printf("heartbeat dropped relay=%s", host)
+				}
 				return err
 			}
 		case <-renewTicker.C:
@@ -213,7 +242,7 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 
 func pingOnce(conn net.Conn, reader *bufio.Reader, interval time.Duration) error {
 	if _, err := io.WriteString(conn, "PING\n"); err != nil {
-		return err
+		return drainReject(conn, reader, err)
 	}
 	slack := 2 * time.Second
 	if interval > slack {
@@ -225,11 +254,61 @@ func pingOnce(conn net.Conn, reader *bufio.Reader, interval time.Duration) error
 	if err != nil {
 		return err
 	}
-	// INVARIANT: never log the line, its length, or a hash. PING/PONG are
-	// control; when this loop forwards webhooks the same rule applies.
-	if trimHeartbeat(line) != "PONG" {
-		return fmt.Errorf("heartbeat: expected PONG")
+	return classifyServerLine(line)
+}
+
+func drainReject(conn net.Conn, reader *bufio.Reader, writeErr error) error {
+	_ = conn.SetReadDeadline(time.Now().Add(drainRejectDeadline))
+	line, err := reader.ReadString('\n')
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		return writeErr
 	}
+	if classified := classifyServerLine(line); errors.As(classified, &Rejection{}) {
+		return classified
+	}
+	return writeErr
+}
+
+func classifyServerLine(line string) error {
+	trimmed := trimHeartbeat(line)
+	// INVARIANT: never log the line, its length, or a hash.
+	if trimmed == "PONG" {
+		return nil
+	}
+	if reason, ok := parseReject(trimmed); ok {
+		return Rejection{Reason: reason}
+	}
+	return fmt.Errorf("heartbeat: expected PONG")
+}
+
+func parseReject(line string) (reason string, ok bool) {
+	var body struct {
+		Type   string `json:"type"`
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal([]byte(line), &body) != nil {
+		return "", false
+	}
+	if body.Type != "reject" {
+		return "", false
+	}
+	return body.Reason, true
+}
+
+func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {
+	if rej.Reason == "revoked" {
+		log.Print(RevokedUserMessage)
+		if err := store.ClearEnrollment(cfg.CertsDir); err != nil {
+			log.Printf("could not finish removing credentials: %v", err)
+		}
+		if err := sysinfo.ClearState(cfg.CertsDir); err != nil {
+			log.Printf("could not clear system-info state: %v", err)
+		}
+	} else {
+		log.Printf("this connection was ended (%s). Not retrying. Credentials were kept.", rej.Reason)
+	}
+	<-ctx.Done()
 	return nil
 }
 

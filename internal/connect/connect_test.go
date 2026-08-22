@@ -2,12 +2,16 @@ package connect
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +22,7 @@ import (
 	"github.com/hookdeploy/hookdeployed/internal/enroll"
 	"github.com/hookdeploy/hookdeployed/internal/mtls"
 	"github.com/hookdeploy/hookdeployed/internal/store"
+	"github.com/hookdeploy/hookdeployed/internal/sysinfo"
 )
 
 func TestParseRelay(t *testing.T) {
@@ -351,4 +356,274 @@ func writeEnrolled(dir string, pki *mtls.PKI) error {
 		return err
 	}
 	return store.Write(dir, caPEM, certPEM, keyPEM)
+}
+
+func writeFullEnrollment(t *testing.T, dir string, pki *mtls.PKI) {
+	t.Helper()
+	if err := writeEnrolled(dir, pki); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "renewal.token"), []byte("hd_agentrenew_us_test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sysinfo.StatePath(dir), []byte(`{"agent_id":"old"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParseRejectAndUnknownType(t *testing.T) {
+	if reason, ok := parseReject(`{"type":"reject","reason":"revoked"}`); !ok || reason != "revoked" {
+		t.Fatalf("revoked: reason=%q ok=%v", reason, ok)
+	}
+	if reason, ok := parseReject(`{"type":"reject","reason":"draining"}`); !ok || reason != "draining" {
+		t.Fatalf("draining: reason=%q ok=%v", reason, ok)
+	}
+	if _, ok := parseReject(`{"type":"other","reason":"revoked"}`); ok {
+		t.Fatal("unknown type must be ignored")
+	}
+	if _, ok := parseReject("PONG"); ok {
+		t.Fatal("PONG is not a reject")
+	}
+	if err := classifyServerLine("PONG\n"); err != nil {
+		t.Fatalf("PONG: %v", err)
+	}
+	if err := classifyServerLine(`{"type":"noop"}` + "\n"); err == nil || err.Error() != "heartbeat: expected PONG" {
+		t.Fatalf("unknown type should look like a bad heartbeat, got %v", err)
+	}
+}
+
+func TestRejectFrameIsNewlineDelimitedJSON(t *testing.T) {
+	frame := `{"type":"reject","reason":"revoked"}` + "\n"
+	if !strings.HasSuffix(frame, "\n") || strings.Count(frame, "\n") != 1 {
+		t.Fatal("old agents require a single newline-delimited line")
+	}
+	var body struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSuffix(frame, "\n")), &body); err != nil || body.Type == "" {
+		t.Fatalf("old agents tolerate JSON-with-type; parse=%v body=%+v", err, body)
+	}
+	if err := classifyServerLine(frame); err != (Rejection{Reason: "revoked"}) {
+		t.Fatalf("classify=%v", err)
+	}
+}
+
+func TestRevokedDeletesFilesLogsAndStopsRetrying(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepts atomic.Int32
+	go serveFrames(ln, `{"type":"reject","reason":"revoked"}`+"\n", &accepts)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:        ln.Addr().String(),
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: 40 * time.Millisecond,
+		})
+	}()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		_, err := store.Load(dir)
+		return err != nil
+	})
+	if !strings.Contains(logs.String(), RevokedUserMessage) {
+		t.Fatalf("missing user message:\n%s", logs.String())
+	}
+	for _, name := range store.EnrollmentFiles {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s still present", name)
+		}
+	}
+	if _, err := os.Stat(sysinfo.StatePath(dir)); !os.IsNotExist(err) {
+		t.Fatal("system-info.json still present")
+	}
+	time.Sleep(150 * time.Millisecond)
+	if accepts.Load() != 1 {
+		t.Fatalf("retries after revoke: accepts=%d", accepts.Load())
+	}
+	if strings.Contains(logs.String(), "disconnected") {
+		t.Fatalf("must not retry: %s", logs.String())
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("dormant cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel while dormant")
+	}
+
+	err = Run(context.Background(), Config{
+		Relay:     ln.Addr().String(),
+		CertsDir:  dir,
+		EnrollURL: "http://127.0.0.1:1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "run `agent enroll` first") {
+		t.Fatalf("after delete: %v", err)
+	}
+}
+
+func TestUnknownReasonIsTerminalWithoutDelete(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	writeFullEnrollment(t, dir, pki)
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepts atomic.Int32
+	go serveFrames(ln, `{"type":"reject","reason":"draining"}`+"\n", &accepts)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:        ln.Addr().String(),
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: 40 * time.Millisecond,
+		})
+	}()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		return strings.Contains(logs.String(), "Credentials were kept")
+	})
+	if _, err := store.Load(dir); err != nil {
+		t.Fatalf("unknown reason must keep credentials: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if accepts.Load() != 1 {
+		t.Fatalf("retries on unknown reason: accepts=%d", accepts.Load())
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("dormant cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
+func TestUnknownTypeStillRetries(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := writeEnrolled(dir, pki); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var accepts atomic.Int32
+	go serveFrames(ln, `{"type":"noop"}`+"\n", &accepts)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:        ln.Addr().String(),
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: 40 * time.Millisecond,
+		})
+	}()
+
+	waitUntil(t, 3*time.Second, func() bool { return accepts.Load() >= 2 })
+	if _, err := store.Load(dir); err != nil {
+		t.Fatalf("unknown type must not delete: %v", err)
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("cancel: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestDrainRejectAfterFailedWrite(t *testing.T) {
+	server, client := net.Pipe()
+	go func() {
+		_, _ = io.WriteString(server, `{"type":"reject","reason":"revoked"}`+"\n")
+		_ = server.Close()
+	}()
+	reader := bufio.NewReader(client)
+	err := drainReject(client, reader, fmt.Errorf("write failed"))
+	_ = client.Close()
+	if err != (Rejection{Reason: "revoked"}) {
+		t.Fatalf("drain=%v", err)
+	}
+}
+
+func serveFrames(ln net.Listener, frame string, accepts *atomic.Int32) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepts.Add(1)
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			_ = conn.Close()
+			continue
+		}
+		if err := tlsConn.Handshake(); err != nil {
+			_ = conn.Close()
+			continue
+		}
+		_, _ = io.WriteString(tlsConn, frame)
+		_ = conn.Close()
+	}
+}
+
+func waitUntil(t *testing.T, d time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out after %s", d)
 }

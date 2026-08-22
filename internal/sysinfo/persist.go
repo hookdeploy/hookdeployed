@@ -28,6 +28,15 @@ func StatePath(certsDir string) string {
 	return filepath.Join(filepath.Dir(certsDir), "system-info.json")
 }
 
+// ClearState removes the change-detection file. Missing is not an error.
+func ClearState(certsDir string) error {
+	err := os.Remove(StatePath(certsDir))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func loadSnapshot(path string) (snapshot, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
