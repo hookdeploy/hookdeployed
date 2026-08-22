@@ -85,22 +85,29 @@ func runEnroll() error {
 func runConnect() error {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
 	relay := fs.String("relay", "", "pin a specific relay host or host:port (default port 9443)")
-	region := fs.String("region", "", "request a relay region (e.g. us-east); ignored when --relay is set")
+	region := fs.String("region", "", "preferred relay region (e.g. us-east); falls back unless --enforce")
+	enforce := fs.Bool("enforce", false, "only connect in --region; do not fall back")
+	fallback := fs.String("fallback", "", "comma-separated regions to try after --region, then fail")
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory (0600 files)")
 	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker for renewal and placement")
 	interval := fs.Duration("ping-interval", connect.DefaultPingInterval, "PING interval")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
-	src := connect.DecideDialSource(*relay, *region)
-	if src.RegionIgnored {
-		log.Printf("--region %s ignored; --relay pins this instance", *region)
+	src, err := connect.ParseConnectFlags(*relay, *region, *enforce, *fallback)
+	if err != nil {
+		return err
+	}
+	if src.RelayWins {
+		log.Print(connect.RelayPinPrecedenceMessage)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return connect.Run(ctx, connect.Config{
 		Relay:           src.Pin,
 		RequestedRegion: src.RequestedRegion,
+		Enforce:         src.Enforce,
+		Fallback:        src.Fallback,
 		CertsDir:        *dir,
 		EnrollURL:       *enrollURL,
 		PingInterval:    *interval,

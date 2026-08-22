@@ -177,7 +177,7 @@ func TestClientRenewPostsCertificate(t *testing.T) {
 }
 
 func TestPlacementPostsTokenAndRegion(t *testing.T) {
-	var got map[string]string
+	var got map[string]any
 	var path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path = r.URL.Path
@@ -188,7 +188,7 @@ func TestPlacementPostsTokenAndRegion(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, err := NewClient(srv.URL).Placement("hd_agentrenew_us_tok", "us-east")
+	out, err := NewClient(srv.URL).Placement("hd_agentrenew_us_tok", PlacementOptions{Region: "us-east"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,6 +199,35 @@ func TestPlacementPostsTokenAndRegion(t *testing.T) {
 		t.Fatalf("body=%#v", got)
 	}
 	if out.Hostname != "relay-us-east-01.hookdeploy.dev" || out.RegionKey != "us-east" {
+		t.Fatalf("%+v", out)
+	}
+}
+
+func TestPlacementPostsEnforceAndFallback(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"hostname":"relay-eu-west-01.hookdeploy.dev","region_key":"eu-west","reason":"explicit_fallback","requested_region":"us-east"}`))
+	}))
+	defer srv.Close()
+
+	out, err := NewClient(srv.URL).Placement("hd_agentrenew_us_tok", PlacementOptions{
+		Region:   "us-east",
+		Fallback: []string{"eu-west"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["region"] != "us-east" {
+		t.Fatalf("body=%#v", got)
+	}
+	raw, _ := json.Marshal(got["fallback"])
+	if string(raw) != `["eu-west"]` {
+		t.Fatalf("fallback=%s", raw)
+	}
+	if out.Reason != "explicit_fallback" || out.RequestedRegion != "us-east" {
 		t.Fatalf("%+v", out)
 	}
 }

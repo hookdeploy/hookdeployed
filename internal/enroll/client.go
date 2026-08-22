@@ -70,6 +70,11 @@ func IsInvalidCode(err error) bool {
 	return errors.As(err, &api) && api.Code == "invalid_code"
 }
 
+func IsEnforcedUnavailable(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.Code == "enforced_region_unavailable"
+}
+
 type TokenResponse struct {
 	Status  string `json:"status"`
 	AgentID string `json:"agent_id"`
@@ -145,16 +150,29 @@ func (c *Client) Renew(certificatePEM, intermediatePEM, rootPEM, csrPEM []byte) 
 }
 
 type PlacementResult struct {
-	Hostname  string `json:"hostname"`
-	RegionKey string `json:"region_key"`
-	Reason    string `json:"reason"`
-	Warning   string `json:"warning"`
+	Hostname         string `json:"hostname"`
+	RegionKey        string `json:"region_key"`
+	Reason           string `json:"reason"`
+	Warning          string `json:"warning"`
+	RequestedRegion  string `json:"requested_region"`
 }
 
-func (c *Client) Placement(renewalToken, region string) (*PlacementResult, error) {
-	body := map[string]string{"renewal_token": renewalToken}
-	if region != "" {
-		body["region"] = region
+type PlacementOptions struct {
+	Region   string
+	Enforce  bool
+	Fallback []string
+}
+
+func (c *Client) Placement(renewalToken string, opts PlacementOptions) (*PlacementResult, error) {
+	body := map[string]any{"renewal_token": renewalToken}
+	if opts.Region != "" {
+		body["region"] = opts.Region
+	}
+	if opts.Enforce {
+		body["enforce"] = true
+	}
+	if len(opts.Fallback) > 0 {
+		body["fallback"] = opts.Fallback
 	}
 	var out PlacementResult
 	if err := c.post("/v1/agents/placement", body, &out); err != nil {
