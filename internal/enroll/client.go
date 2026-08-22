@@ -3,6 +3,7 @@ package enroll
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,7 +23,7 @@ func NewClient(baseURL string) *Client {
 }
 
 type StartResponse struct {
-	UserCode        string `json:"user_code"`
+	SessionID       string `json:"session_id"`
 	DeviceCode      string `json:"device_code"`
 	VerificationURL string `json:"verification_url"`
 	Interval        int    `json:"interval"`
@@ -36,6 +37,8 @@ type Minted struct {
 	Root         string `json:"root"`
 	AgentID      string `json:"agent_id"`
 	OrgID        string `json:"org_id"`
+	OrgName      string `json:"org_name"`
+	OrgSlug      string `json:"org_slug"`
 	RenewalToken string `json:"renewal_token"`
 }
 
@@ -47,6 +50,25 @@ type PollResponse struct {
 	Minted
 }
 
+type APIError struct {
+	Status            int
+	Code              string
+	Message           string
+	AttemptsRemaining int
+}
+
+func (e *APIError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
+func IsInvalidCode(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.Code == "invalid_code"
+}
+
 type TokenResponse struct {
 	Status  string `json:"status"`
 	AgentID string `json:"agent_id"`
@@ -54,8 +76,8 @@ type TokenResponse struct {
 	Minted
 }
 
-func (c *Client) DeviceStart(orgHint, hostname string) (*StartResponse, error) {
-	body := map[string]string{"org_hint": orgHint}
+func (c *Client) DeviceStart(hostname string) (*StartResponse, error) {
+	body := map[string]string{}
 	if hostname != "" {
 		body["hostname"] = hostname
 	}
@@ -66,8 +88,11 @@ func (c *Client) DeviceStart(orgHint, hostname string) (*StartResponse, error) {
 	return &out, nil
 }
 
-func (c *Client) DevicePoll(deviceCode string, csrPEM []byte) (*PollResponse, error) {
+func (c *Client) DevicePoll(deviceCode, userCode string, csrPEM []byte) (*PollResponse, error) {
 	body := map[string]string{"device_code": deviceCode}
+	if userCode != "" {
+		body["user_code"] = userCode
+	}
 	if len(csrPEM) > 0 {
 		body["csr"] = string(csrPEM)
 	}
@@ -144,6 +169,19 @@ func (c *Client) post(path string, body any, dest any) error {
 		return err
 	}
 	if resp.StatusCode >= 300 {
+		var parsed struct {
+			Error             string `json:"error"`
+			Message           string `json:"message"`
+			AttemptsRemaining int    `json:"attempts_remaining"`
+		}
+		if json.Unmarshal(payload, &parsed) == nil && parsed.Error != "" {
+			return &APIError{
+				Status:            resp.StatusCode,
+				Code:              parsed.Error,
+				Message:           parsed.Message,
+				AttemptsRemaining: parsed.AttemptsRemaining,
+			}
+		}
 		return fmt.Errorf("enroll %s: %s: %s", path, resp.Status, payload)
 	}
 	return json.Unmarshal(payload, dest)

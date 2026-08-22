@@ -2,11 +2,46 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 
 	"github.com/hookdeploy/hookdeployed/internal/mtls"
 )
+
+const OrgMetaFile = "org.json"
+
+// OrgMeta is the display name of the org this store is enrolled into.
+// Not secret — 0644, beside the 0600 cert files. Pass 2 will relocate
+// the whole directory per org.
+type OrgMeta struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Slug string `json:"slug"`
+}
+
+func WriteOrgMeta(dir string, meta OrgMeta) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, OrgMetaFile), append(raw, '\n'), 0o644)
+}
+
+func LoadOrgMeta(dir string) (OrgMeta, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, OrgMetaFile))
+	if err != nil {
+		return OrgMeta{}, err
+	}
+	var meta OrgMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return OrgMeta{}, err
+	}
+	return meta, nil
+}
 
 func DefaultDir() string {
 	if env := os.Getenv("HOOKDEPLOY_CERT_DIR"); env != "" {
@@ -68,6 +103,9 @@ func ClearEnrollment(dir string) error {
 		if err != nil && !os.IsNotExist(err) && first == nil {
 			first = err
 		}
+	}
+	if err := os.Remove(filepath.Join(dir, OrgMetaFile)); err != nil && !os.IsNotExist(err) && first == nil {
+		first = err
 	}
 	return first
 }

@@ -1,39 +1,84 @@
 package enroll
 
 import (
+	"bufio"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/hookdeploy/hookdeployed/internal/store"
 )
 
-func RunDevice(baseURL, orgHint, certDir string) error {
+type deviceIO struct {
+	In               io.Reader
+	Out              io.Writer
+	OpenURL          func(string)
+	CheckInteractive func() error
+}
+
+func RunDevice(baseURL, certDir string) error {
+	return runDevice(baseURL, certDir, deviceIO{
+		In:      os.Stdin,
+		Out:     os.Stderr,
+		OpenURL: tryOpenURL,
+		CheckInteractive: func() error {
+			return RequireInteractiveFile(os.Stdin)
+		},
+	})
+}
+
+func runDevice(baseURL, certDir string, io deviceIO) error {
+	if io.CheckInteractive != nil {
+		if err := io.CheckInteractive(); err != nil {
+			return err
+		}
+	}
 	key, keyPEM, err := GenerateKey()
 	if err != nil {
 		return err
 	}
 	client := NewClient(baseURL)
-	start, err := client.DeviceStart(orgHint, localHostname())
+	start, err := client.DeviceStart(localHostname())
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "To approve this agent, open:\n  %s\nEnter code: %s\n", start.VerificationURL, start.UserCode)
-
-	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
-	interval := time.Duration(start.Interval) * time.Second
-	if interval < time.Second {
-		interval = 5 * time.Second
+	if start.VerificationURL == "" {
+		return fmt.Errorf("enrollment start missing verification_url")
+	}
+	PrintEnrollmentURL(io.Out, start.VerificationURL)
+	if io.OpenURL != nil {
+		io.OpenURL(start.VerificationURL)
 	}
 
+	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
+	if start.ExpiresIn <= 0 {
+		deadline = time.Now().Add(10 * time.Minute)
+	}
+	interval := 5 * time.Second
+	if start.Interval > 0 {
+		interval = time.Duration(start.Interval) * time.Second
+	}
+
+	var userCode string
 	var agentID string
-	for time.Now().Before(deadline) {
-		time.Sleep(interval)
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("enrollment expired")
+		}
+		if userCode == "" {
+			userCode, err = ReadUserCode(io.In, io.Out)
+			if err != nil {
+				return err
+			}
+		}
 		var csrPEM []byte
 		if agentID != "" {
 			csrPEM, err = CSRFromKey(key, agentID)
@@ -41,8 +86,13 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 				return err
 			}
 		}
-		poll, err := client.DevicePoll(start.DeviceCode, csrPEM)
+		poll, err := client.DevicePoll(start.DeviceCode, userCode, csrPEM)
 		if err != nil {
+			if IsInvalidCode(err) {
+				fmt.Fprintf(io.Out, "wrong code — try again\n")
+				userCode = ""
+				continue
+			}
 			return err
 		}
 		switch poll.Status {
@@ -50,9 +100,11 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 			if poll.Interval > 0 {
 				interval = time.Duration(poll.Interval) * time.Second
 			}
+			time.Sleep(interval)
 			continue
 		case "slow_down":
 			interval += 5 * time.Second
+			time.Sleep(interval)
 			continue
 		case "denied", "expired":
 			return fmt.Errorf("enrollment %s", poll.Status)
@@ -64,12 +116,84 @@ func RunDevice(baseURL, orgHint, certDir string) error {
 				agentID = poll.AgentID
 				continue
 			}
-			return store.WriteBundle(certDir, []byte(poll.Root), []byte(poll.CertChain), []byte(poll.Certificate), []byte(poll.CA), keyPEM, []byte(poll.RenewalToken))
+			if err := store.WriteBundle(certDir, []byte(poll.Root), []byte(poll.CertChain), []byte(poll.Certificate), []byte(poll.CA), keyPEM, []byte(poll.RenewalToken)); err != nil {
+				return err
+			}
+			orgName := firstNonEmpty(poll.OrgName, poll.Minted.OrgName)
+			if err := store.WriteOrgMeta(certDir, store.OrgMeta{
+				ID:   firstNonEmpty(poll.OrgID, poll.Minted.OrgID),
+				Name: orgName,
+				Slug: firstNonEmpty(poll.OrgSlug, poll.Minted.OrgSlug),
+			}); err != nil {
+				return err
+			}
+			if orgName != "" {
+				fmt.Fprintf(io.Out, "enrolled in %s\n", orgName)
+			} else {
+				fmt.Fprintf(io.Out, "enrolled\n")
+			}
+			return nil
 		default:
 			return fmt.Errorf("unexpected poll status %q", poll.Status)
 		}
 	}
-	return fmt.Errorf("enrollment expired")
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func PrintEnrollmentURL(w io.Writer, url string) {
+	fmt.Fprintf(w, "Open this URL to enroll this agent:\n  %s\n", url)
+}
+
+func RequireInteractiveFile(f *os.File) error {
+	if f == nil {
+		return fmt.Errorf("enroll needs a terminal to enter the code (stdin is not a TTY). Use -token for scripted enrollment")
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return fmt.Errorf("enroll needs a terminal to enter the code (stdin is not a TTY). Use -token for scripted enrollment")
+	}
+	return nil
+}
+
+func ReadUserCode(r io.Reader, w io.Writer) (string, error) {
+	fmt.Fprint(w, "Enter the code from the browser: ")
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && !(err == io.EOF && strings.TrimSpace(line) != "") {
+		if err == io.EOF {
+			return "", fmt.Errorf("enroll needs a terminal to enter the code (stdin is not a TTY). Use -token for scripted enrollment")
+		}
+		return "", err
+	}
+	code := strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(line)))
+	if len(code) != 8 {
+		return "", fmt.Errorf("code must be 8 characters")
+	}
+	return code, nil
+}
+
+// tryOpenURL is best-effort. Failure is not an error — the URL is always printed.
+func tryOpenURL(raw string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", raw)
+	case "darwin":
+		cmd = exec.Command("open", raw)
+	default:
+		cmd = exec.Command("xdg-open", raw)
+	}
+	_ = cmd.Start()
 }
 
 func RunToken(baseURL, token, certDir string) error {
@@ -94,11 +218,16 @@ func RunToken(baseURL, token, certDir string) error {
 	if err != nil {
 		return err
 	}
-	return store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, []byte(out.RenewalToken))
+	if err := store.WriteBundle(certDir, []byte(out.Root), []byte(out.CertChain), []byte(out.Certificate), []byte(out.CA), keyPEM, []byte(out.RenewalToken)); err != nil {
+		return err
+	}
+	return store.WriteOrgMeta(certDir, store.OrgMeta{
+		ID:   out.OrgID,
+		Name: out.OrgName,
+		Slug: out.OrgSlug,
+	})
 }
 
-// ShouldRenew reports whether MaybeRenew should hit the network.
-// Past halfway of a healthy leaf, OR the leaf is expired / not yet valid.
 func localHostname() string {
 	host, err := os.Hostname()
 	if err != nil {

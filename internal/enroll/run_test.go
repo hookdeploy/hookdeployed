@@ -1,6 +1,7 @@
 package enroll
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -226,5 +227,116 @@ func TestMaybeRenewBeforeHalfwayDoesNotPost(t *testing.T) {
 	writeChain(t, dir, chain, "hd_agentrenew_us_unused")
 	if err := MaybeRenew(srv.URL, dir); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPrintEnrollmentURL(t *testing.T) {
+	var buf bytes.Buffer
+	PrintEnrollmentURL(&buf, "https://app.hookdeploy.dev/app/cli-auth/s1")
+	if !strings.Contains(buf.String(), "https://app.hookdeploy.dev/app/cli-auth/s1") {
+		t.Fatalf("url not printed: %q", buf.String())
+	}
+}
+
+func TestReadUserCode(t *testing.T) {
+	var out bytes.Buffer
+	code, err := ReadUserCode(strings.NewReader("abcd-2345\n"), &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != "ABCD2345" {
+		t.Fatalf("code=%q", code)
+	}
+	if !strings.Contains(out.String(), "Enter the code") {
+		t.Fatalf("prompt=%q", out.String())
+	}
+}
+
+func TestRequireInteractiveFilePipeFails(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	defer r.Close()
+	err = RequireInteractiveFile(r)
+	if err == nil || !strings.Contains(err.Error(), "not a TTY") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRunDevicePrintsURLStoresOrgNameAndSucceeds(t *testing.T) {
+	chain, err := GenerateStepLikeChain("agent-1", "org-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startBody, pollBody map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/v1/enroll/device/start":
+			_ = json.Unmarshal(raw, &startBody)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"session_id":       "s1",
+				"device_code":      "dev",
+				"verification_url": "https://app.hookdeploy.dev/app/cli-auth/s1",
+				"interval":         1,
+				"expires_in":       60,
+			})
+		case "/v1/enroll/device/poll":
+			_ = json.Unmarshal(raw, &pollBody)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":        "approved",
+				"certificate":   string(chain.LeafPEM),
+				"ca":            string(chain.IntermediatePEM),
+				"certChain":     string(chain.CertChainPEM),
+				"root":          string(chain.RootPEM),
+				"agent_id":      "agent-1",
+				"org_id":        "org-1",
+				"org_name":      "Acme Corp",
+				"org_slug":      "acme",
+				"renewal_token": "hd_agentrenew_us_x",
+			})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	var out bytes.Buffer
+	var opened string
+	if err := runDevice(srv.URL, dir, deviceIO{
+		In:      strings.NewReader("ABCD-2345\n"),
+		Out:     &out,
+		OpenURL: func(u string) { opened = u },
+		CheckInteractive: func() error {
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := startBody["org_hint"]; ok {
+		t.Fatalf("start sent org_hint: %#v", startBody)
+	}
+	if pollBody["user_code"] != "ABCD2345" {
+		t.Fatalf("poll body=%#v", pollBody)
+	}
+	if !strings.Contains(out.String(), "https://app.hookdeploy.dev/app/cli-auth/s1") {
+		t.Fatalf("URL not printed: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "enrolled in Acme Corp") {
+		t.Fatalf("success did not name org: %q", out.String())
+	}
+	if opened != "https://app.hookdeploy.dev/app/cli-auth/s1" {
+		t.Fatalf("opened=%q", opened)
+	}
+	meta, err := store.LoadOrgMeta(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Name != "Acme Corp" || meta.ID != "org-1" {
+		t.Fatalf("meta=%#v", meta)
 	}
 }
