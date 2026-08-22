@@ -42,8 +42,13 @@ const RevokedUserMessage = "this agent was revoked and can no longer connect. Lo
 // RevokedOrgMessage is logged when the revoked org was one of several.
 const RevokedOrgMessage = "this organization's credentials were removed. Other organizations are still enrolled. Run `agent switch` to pick one, or `agent enroll` to re-enroll this org."
 
-// Rejection is a terminal server→agent frame. Reason "revoked" deletes
-// credentials; any other reason stops retry without deleting.
+// DrainingUserMessage is logged when the relay is taking this box out of
+// rotation. Credentials stay; the next loop iteration re-places.
+const DrainingUserMessage = "this relay is draining. Moving you to another relay. Credentials were kept."
+
+// Rejection is a server→agent frame. Reason "revoked" deletes credentials
+// and stops. Reason "draining" re-places without deleting. Any other
+// reason stops retry without deleting.
 type Rejection struct {
 	Reason string
 }
@@ -352,6 +357,16 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			var rej Rejection
 			if errors.As(err, &rej) {
+				if rej.Reason == "draining" {
+					log.Print(DrainingUserMessage)
+					backoff = NextBackoff(backoff)
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(backoff):
+					}
+					continue
+				}
 				return settleRejection(ctx, cfg, rej)
 			}
 			backoff = NextBackoff(backoff)
@@ -503,6 +518,10 @@ func parseReject(line string) (reason string, ok bool) {
 }
 
 func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {
+	if rej.Reason == "draining" {
+		log.Print(DrainingUserMessage)
+		return nil
+	}
 	if rej.Reason == "revoked" {
 		orgID, _ := store.ReadActive(cfg.CertsDir)
 		if orgID == "" {
