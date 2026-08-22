@@ -43,7 +43,6 @@ func main() {
 func runEnroll() error {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	baseURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker base URL")
-	org := fs.String("org", "", "organization slug (required for device-code)")
 	token := fs.String("token", "", "one-time enrollment token (scripted/CI)")
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory (0600 files)")
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -55,10 +54,7 @@ func runEnroll() error {
 		}
 		return confirmStore(*dir)
 	}
-	if *org == "" {
-		return fmt.Errorf("device-code enroll requires -org <slug> (or pass -token)")
-	}
-	if err := enroll.RunDevice(*baseURL, *org, *dir); err != nil {
+	if err := enroll.RunDevice(*baseURL, *dir); err != nil {
 		return err
 	}
 	return confirmStore(*dir)
@@ -96,7 +92,11 @@ func confirmStore(dir string) error {
 	if len(material.ClientCert.Subject.OrganizationalUnit) > 0 {
 		ou = material.ClientCert.Subject.OrganizationalUnit[0]
 	}
-	log.Printf("stored cert in %s CN=%s OU=%s", dir, cn, ou)
+	if meta, err := store.LoadOrgMeta(dir); err == nil && meta.Name != "" {
+		log.Printf("stored cert in %s org=%s CN=%s OU=%s", dir, meta.Name, cn, ou)
+	} else {
+		log.Printf("stored cert in %s CN=%s OU=%s", dir, cn, ou)
+	}
 	if cn == "" || ou == "" {
 		return fmt.Errorf("enrolled cert missing CN or OU — relay will reject")
 	}

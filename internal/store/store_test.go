@@ -31,3 +31,30 @@ func TestClearEnrollmentClientCrtFirstMakesPartialUnenrolled(t *testing.T) {
 		t.Fatalf("first delete must be client.key so a partial wipe cannot leave a usable identity, got %q", EnrollmentFiles[0])
 	}
 }
+
+func TestWriteOrgMetaIsNotSecretAndLoadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	if err := WriteOrgMeta(dir, OrgMeta{ID: "org-1", Name: "Acme Corp", Slug: "acme"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, OrgMetaFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o400 == 0 {
+		t.Fatalf("org.json missing: mode=%o", info.Mode().Perm())
+	}
+	meta, err := LoadOrgMeta(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Name != "Acme Corp" || meta.ID != "org-1" || meta.Slug != "acme" {
+		t.Fatalf("meta=%#v", meta)
+	}
+	if err := ClearEnrollment(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrgMeta(dir); !os.IsNotExist(err) {
+		t.Fatalf("org.json should be removed on ClearEnrollment, err=%v", err)
+	}
+}

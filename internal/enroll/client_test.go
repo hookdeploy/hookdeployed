@@ -30,6 +30,23 @@ func TestMintedParsesRenewalToken(t *testing.T) {
 	}
 }
 
+func TestMintedParsesOrgName(t *testing.T) {
+	raw := []byte(`{
+		"certificate": "leaf",
+		"agent_id": "agent-1",
+		"org_id": "org-1",
+		"org_name": "Acme Corp",
+		"org_slug": "acme"
+	}`)
+	var minted Minted
+	if err := json.Unmarshal(raw, &minted); err != nil {
+		t.Fatal(err)
+	}
+	if minted.OrgName != "Acme Corp" || minted.OrgSlug != "acme" {
+		t.Fatalf("org name=%q slug=%q", minted.OrgName, minted.OrgSlug)
+	}
+}
+
 func TestMintedMissingRenewalTokenIsEmpty(t *testing.T) {
 	raw := []byte(`{
 		"certificate": "leaf",
@@ -87,13 +104,33 @@ func TestClientDeviceStartSendsHostname(t *testing.T) {
 			t.Errorf("path=%s", r.URL.Path)
 		}
 		w.Header().Set("content-type", "application/json")
-		_, _ = w.Write([]byte(`{"user_code":"ABCD-EFGH","device_code":"dev","verification_url":"https://app.example/agents","interval":5,"expires_in":300}`))
+		_, _ = w.Write([]byte(`{"session_id":"s1","device_code":"dev","verification_url":"https://app.example/app/cli-auth/s1","interval":5,"expires_in":600}`))
 	}))
 	defer srv.Close()
-	if _, err := NewClient(srv.URL).DeviceStart("acme", "michaels-macbook"); err != nil {
+	if _, err := NewClient(srv.URL).DeviceStart("michaels-macbook"); err != nil {
 		t.Fatal(err)
 	}
-	if got["org_hint"] != "acme" || got["hostname"] != "michaels-macbook" {
+	if _, ok := got["org_hint"]; ok {
+		t.Fatalf("org_hint must be omitted, body=%#v", got)
+	}
+	if got["hostname"] != "michaels-macbook" {
+		t.Fatalf("body=%#v", got)
+	}
+}
+
+func TestClientDevicePollSendsUserCode(t *testing.T) {
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"pending","interval":1}`))
+	}))
+	defer srv.Close()
+	if _, err := NewClient(srv.URL).DevicePoll("dev", "ABCD2345", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got["device_code"] != "dev" || got["user_code"] != "ABCD2345" {
 		t.Fatalf("body=%#v", got)
 	}
 }
