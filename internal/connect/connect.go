@@ -12,6 +12,7 @@ import (
 
 	"github.com/hookdeploy/hookdeployed/internal/enroll"
 	"github.com/hookdeploy/hookdeployed/internal/store"
+	"github.com/hookdeploy/hookdeployed/internal/sysinfo"
 )
 
 const (
@@ -34,6 +35,8 @@ type Config struct {
 	RenewInterval time.Duration
 	// Renew overrides enroll.MaybeRenew (tests). Nil uses the real function.
 	Renew func(enrollURL, certDir string) error
+	// Report overrides sysinfo.MaybeReport (tests). Nil uses the real function.
+	Report func(enrollURL, certDir string) error
 }
 
 func ParseRelay(relay string) (host, addr string, err error) {
@@ -82,6 +85,17 @@ func attemptRenew(cfg Config) {
 	}
 }
 
+func attemptReport(cfg Config) {
+	fn := cfg.Report
+	if fn == nil {
+		fn = sysinfo.MaybeReport
+	}
+	if err := fn(cfg.EnrollURL, cfg.CertsDir); err != nil {
+		// Non-fatal. Do not log cfg contents — the token lives in the cert dir.
+		log.Printf("system-info report failed: %v", err)
+	}
+}
+
 func Run(ctx context.Context, cfg Config) error {
 	if cfg.PingInterval <= 0 {
 		cfg.PingInterval = DefaultPingInterval
@@ -103,6 +117,11 @@ func Run(ctx context.Context, cfg Config) error {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
+		// Report before renew so the presented token is the one still on
+		// disk. A 401 from a just-rotated token is non-fatal; the next
+		// connect retries after this iteration's MaybeRenew writes the new
+		// token. Do not add a rotation grace window.
+		attemptReport(cfg)
 		attemptRenew(cfg)
 		if err := dialAndHeartbeat(ctx, cfg, host, addr); err != nil {
 			if ctx.Err() != nil {

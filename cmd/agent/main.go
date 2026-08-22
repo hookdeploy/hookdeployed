@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/hookdeploy/hookdeployed/internal/connect"
 	"github.com/hookdeploy/hookdeployed/internal/enroll"
 	"github.com/hookdeploy/hookdeployed/internal/mtls"
 	"github.com/hookdeploy/hookdeployed/internal/store"
@@ -22,6 +26,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "enroll" {
 		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
 		if err := runEnroll(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "connect" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		if err := runConnect(); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -51,6 +62,28 @@ func runEnroll() error {
 		return err
 	}
 	return confirmStore(*dir)
+}
+
+func runConnect() error {
+	fs := flag.NewFlagSet("connect", flag.ExitOnError)
+	relay := fs.String("relay", "", "relay host or host:port (default port 9443)")
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory (0600 files)")
+	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker for renewal")
+	interval := fs.Duration("ping-interval", connect.DefaultPingInterval, "PING interval")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	if *relay == "" {
+		return fmt.Errorf("--relay is required")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return connect.Run(ctx, connect.Config{
+		Relay:        *relay,
+		CertsDir:     *dir,
+		EnrollURL:    *enrollURL,
+		PingInterval: *interval,
+	})
 }
 
 func confirmStore(dir string) error {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -168,6 +169,80 @@ func TestConnectHandshakeAndTwoPings(t *testing.T) {
 	}
 	if pings.Load() < 2 {
 		t.Fatalf("pings=%d want >= 2", pings.Load())
+	}
+}
+
+func TestReportRunsBeforeRenewAndFailureDoesNotBlockDial(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := writeEnrolled(dir, pki); err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var pings atomic.Int32
+	gotTwo := make(chan struct{})
+	go servePings(ln, &pings, gotTwo)
+
+	var order []string
+	var mu sync.Mutex
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:         ln.Addr().String(),
+			CertsDir:      dir,
+			EnrollURL:     "http://127.0.0.1:1",
+			PingInterval:  40 * time.Millisecond,
+			RenewInterval: time.Hour,
+			Report: func(enrollURL, certDir string) error {
+				mu.Lock()
+				order = append(order, "report")
+				mu.Unlock()
+				return fmt.Errorf("forced report failure")
+			},
+			Renew: func(enrollURL, certDir string) error {
+				mu.Lock()
+				order = append(order, "renew")
+				mu.Unlock()
+				return nil
+			},
+		})
+	}()
+
+	select {
+	case <-gotTwo:
+	case err := <-errCh:
+		t.Fatalf("connect exited before 2 PINGs: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for 2 PINGs; saw %d", pings.Load())
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("clean shutdown: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("connect did not exit after cancel")
+	}
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	if len(got) < 2 || got[0] != "report" || got[1] != "renew" {
+		t.Fatalf("order=%v want report then renew", got)
+	}
+	if pings.Load() < 2 {
+		t.Fatalf("pings=%d want >= 2 (failed report must not block dial)", pings.Load())
 	}
 }
 

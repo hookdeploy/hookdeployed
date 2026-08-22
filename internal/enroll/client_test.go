@@ -78,6 +78,46 @@ func TestClientRenewWithTokenPostsTokenNotLeaf(t *testing.T) {
 	}
 }
 
+func TestClientDeviceStartSendsHostname(t *testing.T) {
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		if r.URL.Path != "/v1/enroll/device/start" {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"user_code":"ABCD-EFGH","device_code":"dev","verification_url":"https://app.example/agents","interval":5,"expires_in":300}`))
+	}))
+	defer srv.Close()
+	if _, err := NewClient(srv.URL).DeviceStart("acme", "michaels-macbook"); err != nil {
+		t.Fatal(err)
+	}
+	if got["org_hint"] != "acme" || got["hostname"] != "michaels-macbook" {
+		t.Fatalf("body=%#v", got)
+	}
+}
+
+func TestClientTokenStartSendsHostnameNotName(t *testing.T) {
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"need_csr","agent_id":"a1","org_id":"o1"}`))
+	}))
+	defer srv.Close()
+	if _, err := NewClient(srv.URL).TokenStart("hd_enroll_us_x", "prod.hookdeploy.dev"); err != nil {
+		t.Fatal(err)
+	}
+	if got["token"] != "hd_enroll_us_x" || got["hostname"] != "prod.hookdeploy.dev" {
+		t.Fatalf("body=%#v", got)
+	}
+	if _, ok := got["name"]; ok {
+		t.Fatal("enroll must not send name")
+	}
+}
+
 func TestClientRenewPostsCertificate(t *testing.T) {
 	var got map[string]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
