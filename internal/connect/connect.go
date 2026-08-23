@@ -1,13 +1,10 @@
 package connect
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -18,6 +15,7 @@ import (
 	"github.com/hookdeploy/hookdeployed/internal/enroll"
 	"github.com/hookdeploy/hookdeployed/internal/store"
 	"github.com/hookdeploy/hookdeployed/internal/sysinfo"
+	"golang.org/x/net/http2"
 )
 
 const (
@@ -30,9 +28,15 @@ const (
 	DefaultRenewInterval = 5 * time.Minute
 	maxBackoff           = 30 * time.Second
 	minBackoff           = time.Second
-	// drainRejectDeadline is how long pingOnce waits for a reject frame
-	// after a PING write fails (the relay may have written then closed).
-	drainRejectDeadline = 200 * time.Millisecond
+
+	// LocalDeliverURL is the hardcoded laptop target for this pass.
+	// Next pass makes this configurable.
+	LocalDeliverURL = "http://127.0.0.1:9999"
+	// ControlPath is reserved. The relay POSTs revoke/drain here.
+	// It is never forwarded to the local service.
+	ControlPath = "/v1/control"
+	// localDeliverTimeout bounds the laptop hop, not the relay session.
+	localDeliverTimeout = 30 * time.Second
 )
 
 // RevokedUserMessage is the jargon-free line logged on reason=revoked
@@ -75,6 +79,8 @@ type Config struct {
 	Report func(enrollURL, certDir string) error
 	// Place overrides enrollment placement (tests). Nil uses enroll.Client.Placement.
 	Place func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error)
+	// LocalURL overrides LocalDeliverURL (tests). Empty uses the constant.
+	LocalURL string
 }
 
 // DialSource is how connect decides pin vs placement.
@@ -395,6 +401,8 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 	if err != nil {
 		return err
 	}
+	tlsCfg = tlsCfg.Clone()
+	tlsCfg.NextProtos = []string{"h2"}
 
 	dialer := &tls.Dialer{Config: tlsCfg}
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
@@ -408,6 +416,12 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 	defer conn.Close()
 	log.Printf("connected relay=%s remote=%s", host, conn.RemoteAddr())
 
+	sess := &session{
+		cfg:    cfg,
+		conn:   conn,
+		reject: make(chan Rejection, 1),
+	}
+
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -418,103 +432,28 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 	}()
 	defer close(done)
 
-	reader := bufio.NewReader(conn)
-	if err := pingOnce(conn, reader, cfg.PingInterval); err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if _, ok := err.(Rejection); !ok {
-			log.Printf("heartbeat dropped relay=%s", host)
-		}
-		return err
-	}
+	go sess.renewLoop(ctx, cfg)
 
-	pingTicker := time.NewTicker(cfg.PingInterval)
-	defer pingTicker.Stop()
-	renewTicker := time.NewTicker(cfg.RenewInterval)
-	defer renewTicker.Stop()
-	lastWall := time.Now()
+	// IdleTimeout must stay zero: HTTP/2 PING does not count as activity,
+	// so a short IdleTimeout would GOAWAY a quiet agent. Liveness is the
+	// relay's ClientConn.Ping. ReadIdleTimeout is also zero — we do not
+	// want the agent to PING-probe and drop a quiet-but-alive relay.
+	h2s := &http2.Server{IdleTimeout: 0}
+	h2s.ServeConn(conn, &http2.ServeConnOpts{
+		Context: ctx,
+		Handler: sess,
+	})
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-pingTicker.C:
-			now := time.Now()
-			if IsWakeEvent(lastWall, now, cfg.PingInterval) {
-				attemptRenew(cfg)
-			}
-			lastWall = now
-			if err := pingOnce(conn, reader, cfg.PingInterval); err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if _, ok := err.(Rejection); !ok {
-					log.Printf("heartbeat dropped relay=%s", host)
-				}
-				return err
-			}
-		case <-renewTicker.C:
-			lastWall = time.Now()
-			attemptRenew(cfg)
-		}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
-}
-
-func pingOnce(conn net.Conn, reader *bufio.Reader, interval time.Duration) error {
-	if _, err := io.WriteString(conn, "PING\n"); err != nil {
-		return drainReject(conn, reader, err)
+	select {
+	case rej := <-sess.reject:
+		return rej
+	default:
 	}
-	slack := 2 * time.Second
-	if interval > slack {
-		slack = interval
-	}
-	_ = conn.SetReadDeadline(time.Now().Add(interval + slack))
-	line, err := reader.ReadString('\n')
-	_ = conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		return err
-	}
-	return classifyServerLine(line)
-}
-
-func drainReject(conn net.Conn, reader *bufio.Reader, writeErr error) error {
-	_ = conn.SetReadDeadline(time.Now().Add(drainRejectDeadline))
-	line, err := reader.ReadString('\n')
-	_ = conn.SetReadDeadline(time.Time{})
-	if err != nil {
-		return writeErr
-	}
-	if classified := classifyServerLine(line); errors.As(classified, &Rejection{}) {
-		return classified
-	}
-	return writeErr
-}
-
-func classifyServerLine(line string) error {
-	trimmed := trimHeartbeat(line)
-	// INVARIANT: never log the line, its length, or a hash.
-	if trimmed == "PONG" {
-		return nil
-	}
-	if reason, ok := parseReject(trimmed); ok {
-		return Rejection{Reason: reason}
-	}
-	return fmt.Errorf("heartbeat: expected PONG")
-}
-
-func parseReject(line string) (reason string, ok bool) {
-	var body struct {
-		Type   string `json:"type"`
-		Reason string `json:"reason"`
-	}
-	if json.Unmarshal([]byte(line), &body) != nil {
-		return "", false
-	}
-	if body.Type != "reject" {
-		return "", false
-	}
-	return body.Reason, true
+	log.Printf("heartbeat dropped relay=%s", host)
+	return fmt.Errorf("session closed")
 }
 
 func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {
@@ -559,11 +498,4 @@ func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {
 	}
 	<-ctx.Done()
 	return nil
-}
-
-func trimHeartbeat(line string) string {
-	for len(line) > 0 && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
-		line = line[:len(line)-1]
-	}
-	return line
 }

@@ -1,7 +1,6 @@
 package connect
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -11,6 +10,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/hookdeploy/hookdeployed/internal/mtls"
 	"github.com/hookdeploy/hookdeployed/internal/store"
 	"github.com/hookdeploy/hookdeployed/internal/sysinfo"
+	"golang.org/x/net/http2"
 )
 
 func TestParseRelay(t *testing.T) {
@@ -164,6 +166,45 @@ func TestRunNoActiveListsOrgsAndAsksToSwitch(t *testing.T) {
 	if strings.Contains(msg, "agent enroll") {
 		t.Fatalf("must not look unenrolled: %q", msg)
 	}
+}
+
+func acceptH2Client(ln net.Listener) (*http2.ClientConn, net.Conn, error) {
+	conn, err := ln.Accept()
+	if err != nil {
+		return nil, nil, err
+	}
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("not tls")
+	}
+	if err := tlsConn.Handshake(); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	cc, err := (&http2.Transport{}).NewClientConn(tlsConn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return cc, tlsConn, nil
+}
+
+func sendTestControl(cc *http2.ClientConn, reason string) error {
+	raw, _ := json.Marshal(map[string]string{"reason": reason})
+	req, err := http.NewRequest(http.MethodPost, "https://agent"+ControlPath, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := cc.RoundTrip(req.WithContext(ctx))
+	if resp != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	return err
 }
 
 func TestConnectHandshakeAndTwoPings(t *testing.T) {
@@ -356,28 +397,16 @@ func TestFailedRenewDoesNotBlockDial(t *testing.T) {
 }
 
 func servePings(ln net.Listener, pings *atomic.Int32, gotTwo chan struct{}) {
-	conn, err := ln.Accept()
+	cc, conn, err := acceptH2Client(ln)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		return
-	}
-	if err := tlsConn.Handshake(); err != nil {
-		return
-	}
-	reader := bufio.NewReader(tlsConn)
 	for {
-		line, err := reader.ReadString('\n')
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := cc.Ping(ctx)
+		cancel()
 		if err != nil {
-			return
-		}
-		if trimHeartbeat(line) != "PING" {
-			continue
-		}
-		if _, err := io.WriteString(tlsConn, "PONG\n"); err != nil {
 			return
 		}
 		if pings.Add(1) == 2 {
@@ -413,40 +442,26 @@ func writeFullEnrollment(t *testing.T, dir string, pki *mtls.PKI) {
 	}
 }
 
-func TestParseRejectAndUnknownType(t *testing.T) {
-	if reason, ok := parseReject(`{"type":"reject","reason":"revoked"}`); !ok || reason != "revoked" {
-		t.Fatalf("revoked: reason=%q ok=%v", reason, ok)
-	}
-	if reason, ok := parseReject(`{"type":"reject","reason":"draining"}`); !ok || reason != "draining" {
-		t.Fatalf("draining: reason=%q ok=%v", reason, ok)
-	}
-	if _, ok := parseReject(`{"type":"other","reason":"revoked"}`); ok {
-		t.Fatal("unknown type must be ignored")
-	}
-	if _, ok := parseReject("PONG"); ok {
-		t.Fatal("PONG is not a reject")
-	}
-	if err := classifyServerLine("PONG\n"); err != nil {
-		t.Fatalf("PONG: %v", err)
-	}
-	if err := classifyServerLine(`{"type":"noop"}` + "\n"); err == nil || err.Error() != "heartbeat: expected PONG" {
-		t.Fatalf("unknown type should look like a bad heartbeat, got %v", err)
-	}
-}
-
-func TestRejectFrameIsNewlineDelimitedJSON(t *testing.T) {
-	frame := `{"type":"reject","reason":"revoked"}` + "\n"
-	if !strings.HasSuffix(frame, "\n") || strings.Count(frame, "\n") != 1 {
-		t.Fatal("old agents require a single newline-delimited line")
-	}
-	var body struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSuffix(frame, "\n")), &body); err != nil || body.Type == "" {
-		t.Fatalf("old agents tolerate JSON-with-type; parse=%v body=%+v", err, body)
-	}
-	if err := classifyServerLine(frame); err != (Rejection{Reason: "revoked"}) {
-		t.Fatalf("classify=%v", err)
+func TestControlHandlerReasons(t *testing.T) {
+	for _, reason := range []string{"revoked", "draining", "nope"} {
+		t.Run(reason, func(t *testing.T) {
+			sess := &session{reject: make(chan Rejection, 1)}
+			rec := httptest.NewRecorder()
+			body := bytes.NewReader([]byte(`{"reason":"` + reason + `"}`))
+			req := httptest.NewRequest(http.MethodPost, ControlPath, body)
+			sess.handleControl(rec, req)
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("status=%d", rec.Code)
+			}
+			select {
+			case got := <-sess.reject:
+				if got.Reason != reason {
+					t.Fatalf("reason=%q", got.Reason)
+				}
+			default:
+				t.Fatal("no rejection queued")
+			}
+		})
 	}
 }
 
@@ -464,7 +479,7 @@ func TestRevokedDeletesFilesLogsAndStopsRetrying(t *testing.T) {
 	}
 	defer ln.Close()
 	var accepts atomic.Int32
-	go serveFrames(ln, `{"type":"reject","reason":"revoked"}`+"\n", &accepts)
+	go serveControl(ln, "revoked", &accepts)
 
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
@@ -610,7 +625,7 @@ func TestRevokedRemovesOnlyThatOrgAndClearsActive(t *testing.T) {
 	}
 	defer ln.Close()
 	var accepts atomic.Int32
-	go serveFrames(ln, `{"type":"reject","reason":"revoked"}`+"\n", &accepts)
+	go serveControl(ln, "revoked", &accepts)
 
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
@@ -670,7 +685,7 @@ func TestUnknownReasonIsTerminalWithoutDelete(t *testing.T) {
 	}
 	defer ln.Close()
 	var accepts atomic.Int32
-	go serveFrames(ln, `{"type":"reject","reason":"nope"}`+"\n", &accepts)
+	go serveControl(ln, "nope", &accepts)
 
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
@@ -725,7 +740,7 @@ func TestDrainingReplacesWithoutDelete(t *testing.T) {
 	}
 	defer ln.Close()
 	var accepts atomic.Int32
-	go serveFrames(ln, `{"type":"reject","reason":"draining"}`+"\n", &accepts)
+	go serveControl(ln, "draining", &accepts)
 
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
@@ -769,7 +784,7 @@ func TestDrainingReplacesWithoutDelete(t *testing.T) {
 	}
 }
 
-func TestUnknownTypeStillRetries(t *testing.T) {
+func TestDeliverRoundTripToLocalURL(t *testing.T) {
 	pki, err := mtls.GenerateTestPKI()
 	if err != nil {
 		t.Fatal(err)
@@ -779,13 +794,51 @@ func TestUnknownTypeStillRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var gotMethod, gotPath, gotQuery, gotHost, gotWebhook, gotBody string
+	var gotConnection string
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.RawQuery
+		gotHost = r.Host
+		gotWebhook = r.Header.Get("X-Webhook-Id")
+		gotConnection = r.Header.Get("Connection")
+		gotBody = string(b)
+		w.Header().Set("X-Local", "yes")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("from-local"))
+	}))
+	defer local.Close()
+
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	var accepts atomic.Int32
-	go serveFrames(ln, `{"type":"noop"}`+"\n", &accepts)
+
+	type result struct {
+		status int
+		body   string
+		local  string
+	}
+	got := make(chan result, 1)
+	go func() {
+		cc, conn, err := acceptH2Client(ln)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, _ := http.NewRequest(http.MethodPut, "https://agent/hooks/stripe?src=test", strings.NewReader("payload-body"))
+		req.Header.Set("X-Webhook-Id", "evt_1")
+		req.Header.Set("Host", "relay.example")
+		req.Header.Set("Connection", "keep-alive")
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		got <- result{status: resp.StatusCode, body: string(b), local: resp.Header.Get("X-Local")}
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -795,56 +848,184 @@ func TestUnknownTypeStillRetries(t *testing.T) {
 			Relay:        ln.Addr().String(),
 			CertsDir:     dir,
 			EnrollURL:    "http://127.0.0.1:1",
-			PingInterval: 40 * time.Millisecond,
+			PingInterval: time.Hour,
+			LocalURL:     local.URL,
 		})
 	}()
 
-	waitUntil(t, 3*time.Second, func() bool { return accepts.Load() >= 2 })
-	if !store.LooksEnrolled(dir) {
-		t.Fatal("unknown type must not delete")
+	select {
+	case r := <-got:
+		if r.status != http.StatusAccepted || r.body != "from-local" || r.local != "yes" {
+			t.Fatalf("relay saw %+v", r)
+		}
+	case err := <-errCh:
+		t.Fatalf("connect exited: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out")
+	}
+	if gotMethod != http.MethodPut || gotPath != "/hooks/stripe" || gotQuery != "src=test" {
+		t.Fatalf("local saw method=%s path=%s query=%s", gotMethod, gotPath, gotQuery)
+	}
+	if gotWebhook != "evt_1" || gotBody != "payload-body" {
+		t.Fatalf("headers/body webhook=%q body=%q", gotWebhook, gotBody)
+	}
+	if gotConnection != "" {
+		t.Fatalf("Connection must be dropped, got %q", gotConnection)
+	}
+	if !strings.Contains(gotHost, "127.0.0.1") && !strings.Contains(gotHost, "localhost") {
+		t.Fatalf("Host rewritten to local, got %q", gotHost)
 	}
 	cancel()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("cancel: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return after cancel")
-	}
+	<-errCh
 }
 
-func TestDrainRejectAfterFailedWrite(t *testing.T) {
-	server, client := net.Pipe()
+func TestFailedLocalDeliverKeepsSession(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := writeEnrolled(dir, pki); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	done := make(chan error, 1)
 	go func() {
-		_, _ = io.WriteString(server, `{"type":"reject","reason":"revoked"}`+"\n")
-		_ = server.Close()
+		cc, conn, err := acceptH2Client(ln)
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+		req, _ := http.NewRequest(http.MethodPost, "https://agent/", strings.NewReader("x"))
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
+			done <- err
+			return
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			done <- fmt.Errorf("status=%d want 502", resp.StatusCode)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		done <- cc.Ping(ctx)
 	}()
-	reader := bufio.NewReader(client)
-	err := drainReject(client, reader, fmt.Errorf("write failed"))
-	_ = client.Close()
-	if err != (Rejection{Reason: "revoked"}) {
-		t.Fatalf("drain=%v", err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = Run(ctx, Config{
+			Relay:        ln.Addr().String(),
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: time.Hour,
+			LocalURL:     "http://127.0.0.1:1",
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out")
 	}
 }
 
-func serveFrames(ln net.Listener, frame string, accepts *atomic.Int32) {
+func TestLargeDeliverDoesNotBlockPing(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := writeEnrolled(dir, pki); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		time.Sleep(250 * time.Millisecond)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	pingOK := make(chan error, 1)
+	go func() {
+		cc, conn, err := acceptH2Client(ln)
+		if err != nil {
+			pingOK <- err
+			return
+		}
+		defer conn.Close()
+		req, _ := http.NewRequest(http.MethodPost, "https://agent/big", strings.NewReader(strings.Repeat("y", 512*1024)))
+		done := make(chan error, 1)
+		go func() {
+			resp, err := cc.RoundTrip(req)
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			done <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			pingOK <- fmt.Errorf("deliver did not start")
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := cc.Ping(ctx); err != nil {
+			pingOK <- err
+			return
+		}
+		<-done
+		pingOK <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = Run(ctx, Config{
+			Relay:        ln.Addr().String(),
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: time.Hour,
+			LocalURL:     local.URL,
+		})
+	}()
+	select {
+	case err := <-pingOK:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out")
+	}
+}
+
+func serveControl(ln net.Listener, reason string, accepts *atomic.Int32) {
 	for {
-		conn, err := ln.Accept()
+		cc, conn, err := acceptH2Client(ln)
 		if err != nil {
 			return
 		}
 		accepts.Add(1)
-		tlsConn, ok := conn.(*tls.Conn)
-		if !ok {
-			_ = conn.Close()
-			continue
-		}
-		if err := tlsConn.Handshake(); err != nil {
-			_ = conn.Close()
-			continue
-		}
-		_, _ = io.WriteString(tlsConn, frame)
+		_ = sendTestControl(cc, reason)
+		_ = cc.Close()
 		_ = conn.Close()
 	}
 }
