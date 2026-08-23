@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -795,13 +796,14 @@ func TestDeliverRoundTripToLocalURL(t *testing.T) {
 	}
 
 	var gotMethod, gotPath, gotQuery, gotHost, gotWebhook, gotBody string
-	var gotConnection string
+	var gotConnection, gotTargetPort string
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.RawQuery
 		gotHost = r.Host
 		gotWebhook = r.Header.Get("X-Webhook-Id")
 		gotConnection = r.Header.Get("Connection")
+		gotTargetPort = r.Header.Get("X-Hd-Target-Port")
 		gotBody = string(b)
 		w.Header().Set("X-Local", "yes")
 		w.WriteHeader(http.StatusAccepted)
@@ -829,6 +831,7 @@ func TestDeliverRoundTripToLocalURL(t *testing.T) {
 		defer conn.Close()
 		req, _ := http.NewRequest(http.MethodPut, "https://agent/hooks/stripe?src=test", strings.NewReader("payload-body"))
 		req.Header.Set("X-Webhook-Id", "evt_1")
+		req.Header.Set("X-Hd-Target-Port", "9999")
 		req.Header.Set("Host", "relay.example")
 		req.Header.Set("Connection", "keep-alive")
 		resp, err := cc.RoundTrip(req)
@@ -872,6 +875,9 @@ func TestDeliverRoundTripToLocalURL(t *testing.T) {
 	if gotConnection != "" {
 		t.Fatalf("Connection must be dropped, got %q", gotConnection)
 	}
+	if gotTargetPort != "" {
+		t.Fatalf("X-Hd-Target-Port must not reach the local service, got %q", gotTargetPort)
+	}
 	if !strings.Contains(gotHost, "127.0.0.1") && !strings.Contains(gotHost, "localhost") {
 		t.Fatalf("Host rewritten to local, got %q", gotHost)
 	}
@@ -911,6 +917,10 @@ func TestFailedLocalDeliverKeepsSession(t *testing.T) {
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusBadGateway {
 			done <- fmt.Errorf("status=%d want 502", resp.StatusCode)
+			return
+		}
+		if resp.Header.Get(HeaderError) != ErrLocalRefused {
+			done <- fmt.Errorf("x-hd-error=%s want %s", resp.Header.Get(HeaderError), ErrLocalRefused)
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1370,5 +1380,174 @@ func TestEnforcedUnavailableBacksOffWithoutExiting(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after cancel")
+	}
+}
+
+type errAfterBytes struct {
+	data []byte
+	off  int
+	err  error
+}
+
+func (e *errAfterBytes) Read(p []byte) (int, error) {
+	if e.off >= len(e.data) {
+		return 0, e.err
+	}
+	n := copy(p, e.data[e.off:])
+	e.off += n
+	return n, nil
+}
+
+func TestIncompletePayloadDoesNotProxyLocal2xx(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("should-not-proxy"))
+	}))
+	defer local.Close()
+
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	s := &session{cfg: Config{LocalURL: local.URL}}
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader("short"))
+	req.ContentLength = 100
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	if rr.Header().Get(HeaderError) != ErrIncompletePayload {
+		t.Fatalf("error=%s", rr.Header().Get(HeaderError))
+	}
+	if strings.Contains(rr.Body.String(), "should-not-proxy") {
+		t.Fatal("proxied local 2xx body")
+	}
+	if !strings.Contains(logs.String(), "error="+ErrIncompletePayload) {
+		t.Fatalf("log=%s", logs.String())
+	}
+}
+
+func TestCompleteDeliverUnchanged(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if string(b) != "hello" {
+			t.Errorf("body=%q", b)
+		}
+		w.Header().Set("X-Local", "yes")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("from-local"))
+	}))
+	defer local.Close()
+
+	s := &session{cfg: Config{LocalURL: local.URL}}
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader("hello"))
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusAccepted || rr.Body.String() != "from-local" {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get(HeaderError) != "" {
+		t.Fatalf("unexpected x-hd-error=%s", rr.Header().Get(HeaderError))
+	}
+	if rr.Header().Get("X-Local") != "yes" {
+		t.Fatalf("headers=%v", rr.Header())
+	}
+}
+
+func TestChunkedBodyTruncatedIsIncomplete(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+
+	s := &session{cfg: Config{LocalURL: local.URL}}
+	req := httptest.NewRequest(http.MethodPost, "/hook", io.NopCloser(&errAfterBytes{
+		data: []byte("xxxxx"),
+		err:  io.ErrUnexpectedEOF,
+	}))
+	req.ContentLength = -1
+	req.Header.Del("Content-Length")
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get(HeaderError) != ErrIncompletePayload {
+		t.Fatalf("error=%s", rr.Header().Get(HeaderError))
+	}
+}
+
+func TestLocalRefusedDistinctFromLocalError(t *testing.T) {
+	s := &session{cfg: Config{LocalURL: "http://127.0.0.1:1"}}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusBadGateway || rr.Header().Get(HeaderError) != ErrLocalRefused {
+		t.Fatalf("refused status=%d error=%s", rr.Code, rr.Header().Get(HeaderError))
+	}
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		http.Error(w, "app down", http.StatusBadGateway)
+	}))
+	defer local.Close()
+	s2 := &session{cfg: Config{LocalURL: local.URL}}
+	req2 := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+	rr2 := httptest.NewRecorder()
+	s2.handleDeliver(rr2, req2)
+	if rr2.Code != http.StatusBadGateway || rr2.Header().Get(HeaderError) != ErrLocalError {
+		t.Fatalf("local 502 status=%d error=%s", rr2.Code, rr2.Header().Get(HeaderError))
+	}
+	if !strings.Contains(rr2.Body.String(), "app down") {
+		t.Fatalf("body=%s", rr2.Body.String())
+	}
+}
+
+func TestShortBodyLocal400IsLocalErrorNotIncomplete(t *testing.T) {
+	var logs bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if len(b) < 10 {
+			http.Error(w, "too short", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+
+	s := &session{cfg: Config{LocalURL: local.URL}}
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader("short"))
+	req.ContentLength = 20
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusBadRequest || rr.Header().Get(HeaderError) != ErrLocalError {
+		t.Fatalf("status=%d error=%s", rr.Code, rr.Header().Get(HeaderError))
+	}
+	if !strings.Contains(logs.String(), "error="+ErrLocalError) || !strings.Contains(logs.String(), "incomplete=1") {
+		t.Fatalf("log should name local_error and incomplete=1, got %s", logs.String())
+	}
+	if strings.Contains(logs.String(), "error="+ErrIncompletePayload) {
+		t.Fatalf("must not use incomplete_payload when the local service returned 400: %s", logs.String())
+	}
+}
+
+func TestClassifyLocalErrTimeoutAndRefused(t *testing.T) {
+	if classifyLocalErr(context.DeadlineExceeded) != ErrLocalTimeout {
+		t.Fatal("deadline")
+	}
+	refused := &net.OpError{Op: "dial", Err: errors.New("connectex: No connection could be made because the target machine actively refused it.")}
+	if classifyLocalErr(refused) != ErrLocalRefused {
+		t.Fatalf("refused got %s", classifyLocalErr(refused))
+	}
+	if classifyLocalErr(io.ErrUnexpectedEOF) != ErrIncompletePayload {
+		t.Fatal("unexpected eof")
 	}
 }

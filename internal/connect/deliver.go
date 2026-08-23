@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -12,8 +13,17 @@ import (
 	"time"
 )
 
+// Stable deliver error identifiers. They ride X-Hd-Error up the chain.
+const (
+	ErrLocalRefused      = "local_refused"
+	ErrLocalError        = "local_error"
+	ErrLocalTimeout      = "local_timeout"
+	ErrIncompletePayload = "incomplete_payload"
+	HeaderError          = "X-Hd-Error"
+)
+
 // hopByHop are RFC 7230 hop-by-hop headers plus Host (rewritten to the
-// local target so laptop frameworks do not see the relay's authority).
+// local target so frameworks on the agent's machine do not see the relay's authority).
 var hopByHop = map[string]bool{
 	"Connection":          true,
 	"Keep-Alive":          true,
@@ -63,11 +73,36 @@ func (s *session) handleControl(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func writeDeliverErr(w http.ResponseWriter, status int, code string) {
+	w.Header().Set(HeaderError, code)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, code)
+}
+
+type countingReader struct {
+	r io.ReadCloser
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+func (c *countingReader) Close() error {
+	if c.r == nil {
+		return nil
+	}
+	return c.r.Close()
+}
+
 func (s *session) handleDeliver(w http.ResponseWriter, r *http.Request) {
 	base, err := url.Parse(s.localURL())
 	if err != nil {
-		log.Printf("local deliver failed: %v", err)
-		http.Error(w, "bad local url", http.StatusBadGateway)
+		log.Printf("local deliver error=write_failed")
+		writeDeliverErr(w, http.StatusBadGateway, "write_failed")
 		return
 	}
 	out := *base
@@ -76,36 +111,121 @@ func (s *session) handleDeliver(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), localDeliverTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, r.Method, out.String(), r.Body)
+	counted := &countingReader{r: r.Body}
+	req, err := http.NewRequestWithContext(ctx, r.Method, out.String(), counted)
 	if err != nil {
-		log.Printf("local deliver failed: %v", err)
-		http.Error(w, "build request", http.StatusBadGateway)
+		log.Printf("local deliver error=write_failed")
+		writeDeliverErr(w, http.StatusBadGateway, "write_failed")
 		return
 	}
 	copyHeaders(req.Header, r.Header)
 	req.Host = base.Host
+	// Do not declare the inbound Content-Length on the hop to the agent's machine.
+	// The agent is the verifier; a short body with a larger CL would
+	// make net/http refuse to send at all.
+	req.ContentLength = -1
+	req.Header.Del("Content-Length")
 
 	resp, err := http.DefaultClient.Do(req)
+	declared := r.ContentLength
+	written := counted.n
+	mismatch := declared > 0 && written != declared
+
 	if err != nil {
-		log.Printf("local deliver failed: %v", err)
-		http.Error(w, "local request failed", http.StatusBadGateway)
+		code := classifyLocalErr(err)
+		if mismatch && code != ErrLocalRefused && code != ErrLocalTimeout {
+			code = ErrIncompletePayload
+		}
+		status := http.StatusBadGateway
+		if code == ErrLocalTimeout {
+			status = http.StatusGatewayTimeout
+		}
+		log.Printf("local deliver error=%s declared=%d written=%d", code, declared, written)
+		writeDeliverErr(w, status, code)
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("local deliver status=%d", resp.StatusCode)
+
+	if mismatch && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Printf("local deliver error=%s declared=%d written=%d local_status=%d",
+			ErrIncompletePayload, declared, written, resp.StatusCode)
+		writeDeliverErr(w, http.StatusBadGateway, ErrIncompletePayload)
+		return
 	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if mismatch {
+			log.Printf("local deliver error=%s declared=%d written=%d local_status=%d incomplete=1",
+				ErrLocalError, declared, written, resp.StatusCode)
+		} else {
+			log.Printf("local deliver error=%s status=%d", ErrLocalError, resp.StatusCode)
+		}
+		copyHeaders(w.Header(), resp.Header)
+		w.Header().Set(HeaderError, ErrLocalError)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
 
+func classifyLocalErr(err error) string {
+	if err == nil {
+		return ErrIncompletePayload
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrLocalTimeout
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return ErrLocalTimeout
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+		return ErrLocalTimeout
+	}
+	if strings.Contains(msg, "connection refused") || strings.Contains(msg, "actively refused") {
+		return ErrLocalRefused
+	}
+	var op *net.OpError
+	if errors.As(err, &op) {
+		low := strings.ToLower(op.Error())
+		if strings.Contains(low, "refused") {
+			return ErrLocalRefused
+		}
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return ErrIncompletePayload
+	}
+	if strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "stream closed") ||
+		strings.Contains(msg, "stream reset") ||
+		strings.Contains(msg, "connection reset") {
+		return ErrIncompletePayload
+	}
+	if strings.Contains(msg, "connect") || strings.Contains(msg, "dial") {
+		return ErrLocalRefused
+	}
+	return ErrIncompletePayload
+}
+
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
-		if hopByHop[http.CanonicalHeaderKey(k)] {
+		ck := http.CanonicalHeaderKey(k)
+		if hopByHop[ck] {
 			continue
 		}
-		if http.CanonicalHeaderKey(k) == "Connection" {
+		if ck == "Connection" {
+			continue
+		}
+		// Transport metadata (x-hd-*) rides the HTTP/2 session so the
+		// next pass can honor target.port. It must not reach the local service.
+		if strings.HasPrefix(ck, "X-Hd-") {
+			continue
+		}
+		if ck == "Content-Length" {
 			continue
 		}
 		for _, v := range vs {
