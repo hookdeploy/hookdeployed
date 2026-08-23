@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,7 +21,9 @@ const (
 	ErrLocalError        = "local_error"
 	ErrLocalTimeout      = "local_timeout"
 	ErrIncompletePayload = "incomplete_payload"
+	ErrInvalidTargetPort = "invalid_target_port"
 	HeaderError          = "X-Hd-Error"
+	HeaderTargetPort     = "X-Hd-Target-Port"
 )
 
 // hopByHop are RFC 7230 hop-by-hop headers plus Host (rewritten to the
@@ -43,11 +47,25 @@ type session struct {
 	reject chan Rejection
 }
 
-func (s *session) localURL() string {
-	if s.cfg.LocalURL != "" {
-		return s.cfg.LocalURL
+func parseTargetPort(r *http.Request) (int, bool) {
+	raw := strings.TrimSpace(r.Header.Get(HeaderTargetPort))
+	if raw == "" {
+		return 0, false
 	}
-	return LocalDeliverURL
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
+}
+
+// localBaseURL is always loopback in production. LocalURL is a test override
+// of the whole URL (httptest.Server). The host is never taken from the request.
+func (s *session) localBaseURL(port int) (*url.URL, error) {
+	if s.cfg.LocalURL != "" {
+		return url.Parse(s.cfg.LocalURL)
+	}
+	return url.Parse(fmt.Sprintf("http://%s:%d", localLoopbackHost, port))
 }
 
 func (s *session) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +117,13 @@ func (c *countingReader) Close() error {
 }
 
 func (s *session) handleDeliver(w http.ResponseWriter, r *http.Request) {
-	base, err := url.Parse(s.localURL())
+	port, ok := parseTargetPort(r)
+	if !ok && s.cfg.LocalURL == "" {
+		log.Printf("local deliver error=%s", ErrInvalidTargetPort)
+		writeDeliverErr(w, http.StatusBadRequest, ErrInvalidTargetPort)
+		return
+	}
+	base, err := s.localBaseURL(port)
 	if err != nil {
 		log.Printf("local deliver error=write_failed")
 		writeDeliverErr(w, http.StatusBadGateway, "write_failed")
@@ -229,8 +253,8 @@ func copyHeaders(dst, src http.Header) {
 		if ck == "Connection" {
 			continue
 		}
-		// Transport metadata (x-hd-*) rides the HTTP/2 session so the
-		// next pass can honor target.port. It must not reach the local service.
+		// Transport metadata (x-hd-*) rides the HTTP/2 session (agent id,
+		// method, target port/path). It must not reach the local service.
 		if strings.HasPrefix(ck, "X-Hd-") {
 			continue
 		}

@@ -29,9 +29,9 @@ const (
 	maxBackoff           = 30 * time.Second
 	minBackoff           = time.Second
 
-	// LocalDeliverURL is the hardcoded local-service target for this pass.
-	// Next pass makes this configurable.
-	LocalDeliverURL = "http://127.0.0.1:9999"
+	// localLoopbackHost is the only host a delivery may reach. The port
+	// comes from X-Hd-Target-Port; the host is never read from the request.
+	localLoopbackHost = "127.0.0.1"
 	// ControlPath is reserved. The relay POSTs revoke/drain here.
 	// It is never forwarded to the local service.
 	ControlPath = "/v1/control"
@@ -79,7 +79,8 @@ type Config struct {
 	Report func(enrollURL, certDir string) error
 	// Place overrides enrollment placement (tests). Nil uses enroll.Client.Placement.
 	Place func(enrollURL, token string, opts enroll.PlacementOptions) (*enroll.PlacementResult, error)
-	// LocalURL overrides LocalDeliverURL (tests). Empty uses the constant.
+	// LocalURL overrides the loopback URL built from X-Hd-Target-Port (tests).
+	// Production leaves this empty so the inbound port is honored.
 	LocalURL string
 }
 
