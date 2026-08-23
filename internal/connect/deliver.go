@@ -120,11 +120,14 @@ func (s *session) handleDeliver(w http.ResponseWriter, r *http.Request) {
 	}
 	copyHeaders(req.Header, r.Header)
 	req.Host = base.Host
-	// Do not declare the inbound Content-Length on the hop to the agent's machine.
-	// The agent is the verifier; a short body with a larger CL would
-	// make net/http refuse to send at all.
-	req.ContentLength = -1
-	req.Header.Del("Content-Length")
+	// NewRequest leaves ContentLength 0 for an arbitrary io.Reader
+	// (countingReader), so the transport would chunk. Propagate the
+	// inbound length when known. The client writes Content-Length from
+	// this field (Request.outgoingLength); Header["Content-Length"] is
+	// ignored on the way out — do not set both.
+	if r.ContentLength > 0 {
+		req.ContentLength = r.ContentLength
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	declared := r.ContentLength
@@ -205,7 +208,13 @@ func classifyLocalErr(err error) string {
 		strings.Contains(msg, "connection reset") {
 		return ErrIncompletePayload
 	}
-	if strings.Contains(msg, "connect") || strings.Contains(msg, "dial") {
+	if strings.Contains(msg, "contentlength=") {
+		return ErrIncompletePayload
+	}
+	// "connect" is a prefix of "connection broken" (the Content-Length
+	// mismatch wording). Only treat real dial failures as refused.
+	if strings.Contains(msg, "dial tcp") || strings.Contains(msg, "dial udp") ||
+		strings.Contains(msg, "connectex") {
 		return ErrLocalRefused
 	}
 	return ErrIncompletePayload

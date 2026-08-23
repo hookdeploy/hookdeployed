@@ -1524,18 +1524,61 @@ func TestShortBodyLocal400IsLocalErrorNotIncomplete(t *testing.T) {
 	defer local.Close()
 
 	s := &session{cfg: Config{LocalURL: local.URL}}
+	// Complete body (CL matches written); the service still rejects it.
 	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader("short"))
-	req.ContentLength = 20
 	rr := httptest.NewRecorder()
 	s.handleDeliver(rr, req)
 	if rr.Code != http.StatusBadRequest || rr.Header().Get(HeaderError) != ErrLocalError {
 		t.Fatalf("status=%d error=%s", rr.Code, rr.Header().Get(HeaderError))
 	}
-	if !strings.Contains(logs.String(), "error="+ErrLocalError) || !strings.Contains(logs.String(), "incomplete=1") {
-		t.Fatalf("log should name local_error and incomplete=1, got %s", logs.String())
+	if !strings.Contains(logs.String(), "error="+ErrLocalError) {
+		t.Fatalf("log should name local_error, got %s", logs.String())
 	}
 	if strings.Contains(logs.String(), "error="+ErrIncompletePayload) {
 		t.Fatalf("must not use incomplete_payload when the local service returned 400: %s", logs.String())
+	}
+}
+
+func TestLocalHopGetsContentLengthWhenInboundDeclared(t *testing.T) {
+	var gotCL int64
+	var gotTE string
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCL = r.ContentLength
+		gotTE = r.Header.Get("Transfer-Encoding")
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+
+	s := &session{cfg: Config{LocalURL: local.URL}}
+	body := "hello-cl"
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader(body))
+	if req.ContentLength != int64(len(body)) {
+		t.Fatalf("inbound ContentLength=%d", req.ContentLength)
+	}
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	if gotCL != int64(len(body)) {
+		t.Fatalf("local ContentLength=%d want %d (chunked te=%q)", gotCL, len(body), gotTE)
+	}
+	if strings.EqualFold(gotTE, "chunked") {
+		t.Fatalf("local hop was chunked; want Content-Length")
+	}
+
+	gotCL, gotTE = 0, ""
+	chunked := httptest.NewRequest(http.MethodPost, "/hook", io.NopCloser(strings.NewReader(body)))
+	chunked.ContentLength = -1
+	chunked.Header.Del("Content-Length")
+	rr2 := httptest.NewRecorder()
+	s.handleDeliver(rr2, chunked)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("chunked inbound status=%d", rr2.Code)
+	}
+	if gotCL > 0 {
+		t.Fatalf("chunked inbound must not declare Content-Length on the local hop, got %d", gotCL)
 	}
 }
 
