@@ -29,13 +29,13 @@ const (
 	maxBackoff           = 30 * time.Second
 	minBackoff           = time.Second
 
-	// LocalDeliverURL is the hardcoded laptop target for this pass.
+	// LocalDeliverURL is the hardcoded local-service target for this pass.
 	// Next pass makes this configurable.
 	LocalDeliverURL = "http://127.0.0.1:9999"
 	// ControlPath is reserved. The relay POSTs revoke/drain here.
 	// It is never forwarded to the local service.
 	ControlPath = "/v1/control"
-	// localDeliverTimeout bounds the laptop hop, not the relay session.
+	// localDeliverTimeout bounds the hop to the agent's machine, not the relay session.
 	localDeliverTimeout = 30 * time.Second
 )
 
