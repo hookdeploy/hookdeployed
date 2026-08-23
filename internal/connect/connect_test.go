@@ -13,7 +13,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strconv"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1594,3 +1596,132 @@ func TestClassifyLocalErrTimeoutAndRefused(t *testing.T) {
 		t.Fatal("unexpected eof")
 	}
 }
+
+func localListenPort(t *testing.T, rawURL string) int {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestHonorTargetPortRoutesToReceivedPort(t *testing.T) {
+	var gotHost, gotTargetPort string
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		gotTargetPort = r.Header.Get(HeaderTargetPort)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+
+	port := localListenPort(t, local.URL)
+	s := &session{}
+	req := httptest.NewRequest(http.MethodPost, "/hook", strings.NewReader("x"))
+	req.Header.Set(HeaderTargetPort, strconv.Itoa(port))
+	req.Header.Set("X-Hd-Agent-Id", "agent-1")
+	req.Header.Set("X-Hd-Target-Path", "/secret")
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.HasPrefix(gotHost, localLoopbackHost+":") {
+		t.Fatalf("host=%q want loopback", gotHost)
+	}
+	if gotTargetPort != "" {
+		t.Fatalf("X-Hd-Target-Port must not reach the local service, got %q", gotTargetPort)
+	}
+}
+
+func TestHonorTargetPortDifferentPorts(t *testing.T) {
+	var hitsA, hitsB int
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsA++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer a.Close()
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitsB++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer b.Close()
+
+	s := &session{}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+	req.Header.Set(HeaderTargetPort, strconv.Itoa(localListenPort(t, a.URL)))
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusOK || hitsA != 1 || hitsB != 0 {
+		t.Fatalf("status=%d hitsA=%d hitsB=%d", rr.Code, hitsA, hitsB)
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+	req2.Header.Set(HeaderTargetPort, strconv.Itoa(localListenPort(t, b.URL)))
+	rr2 := httptest.NewRecorder()
+	s.handleDeliver(rr2, req2)
+	if rr2.Code != http.StatusOK || hitsA != 1 || hitsB != 1 {
+		t.Fatalf("second status=%d hitsA=%d hitsB=%d", rr2.Code, hitsA, hitsB)
+	}
+}
+
+func TestHonorTargetPortAlwaysLoopback(t *testing.T) {
+	var gotHost string
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer local.Close()
+
+	s := &session{}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+	req.Header.Set(HeaderTargetPort, strconv.Itoa(localListenPort(t, local.URL)))
+	req.Host = "evil.example"
+	req.Header.Set("X-Forwarded-Host", "169.254.169.254")
+	req.Header.Set("X-Hd-Target-Host", "10.0.0.1")
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d", rr.Code)
+	}
+	host, _, err := net.SplitHostPort(gotHost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != localLoopbackHost && host != "localhost" {
+		t.Fatalf("host=%q", gotHost)
+	}
+}
+
+func TestMissingTargetPortFailsDistinctly(t *testing.T) {
+	s := &session{}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+	rr := httptest.NewRecorder()
+	s.handleDeliver(rr, req)
+	if rr.Code != http.StatusBadRequest || rr.Header().Get(HeaderError) != ErrInvalidTargetPort {
+		t.Fatalf("status=%d error=%s", rr.Code, rr.Header().Get(HeaderError))
+	}
+}
+
+func TestUnparseableTargetPortFailsDistinctly(t *testing.T) {
+	s := &session{}
+	for _, raw := range []string{"abc", "0", "65536", "22.5"} {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("x"))
+		req.Header.Set(HeaderTargetPort, raw)
+		rr := httptest.NewRecorder()
+		s.handleDeliver(rr, req)
+		if rr.Code != http.StatusBadRequest || rr.Header().Get(HeaderError) != ErrInvalidTargetPort {
+			t.Fatalf("port=%q status=%d error=%s", raw, rr.Code, rr.Header().Get(HeaderError))
+		}
+	}
+}
+
