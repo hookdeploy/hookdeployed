@@ -51,11 +51,19 @@ type PollResponse struct {
 	Minted
 }
 
+type DestinationRef struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	DestinationType string `json:"destination_type"`
+}
+
 type APIError struct {
 	Status            int
 	Code              string
 	Message           string
 	AttemptsRemaining int
+	// Destinations is set on 409 ambiguous_destination from tap create.
+	Destinations []DestinationRef
 }
 
 func (e *APIError) Error() string {
@@ -150,11 +158,11 @@ func (c *Client) Renew(certificatePEM, intermediatePEM, rootPEM, csrPEM []byte) 
 }
 
 type PlacementResult struct {
-	Hostname         string `json:"hostname"`
-	RegionKey        string `json:"region_key"`
-	Reason           string `json:"reason"`
-	Warning          string `json:"warning"`
-	RequestedRegion  string `json:"requested_region"`
+	Hostname        string `json:"hostname"`
+	RegionKey       string `json:"region_key"`
+	Reason          string `json:"reason"`
+	Warning         string `json:"warning"`
+	RequestedRegion string `json:"requested_region"`
 }
 
 type PlacementOptions struct {
@@ -205,6 +213,12 @@ func (c *Client) RenewWithToken(renewalToken string, csrPEM []byte) (*TokenRespo
 	return &out, nil
 }
 
+// Post is the renewal-token HTTP client. Callers must not send anything
+// that rotates the token — taps, placement, and system-info are reads.
+func (c *Client) Post(path string, body any, dest any) error {
+	return c.post(path, body, dest)
+}
+
 func (c *Client) post(path string, body any, dest any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -221,9 +235,10 @@ func (c *Client) post(path string, body any, dest any) error {
 	}
 	if resp.StatusCode >= 300 {
 		var parsed struct {
-			Error             string `json:"error"`
-			Message           string `json:"message"`
-			AttemptsRemaining int    `json:"attempts_remaining"`
+			Error             string           `json:"error"`
+			Message           string           `json:"message"`
+			AttemptsRemaining int              `json:"attempts_remaining"`
+			Destinations      []DestinationRef `json:"destinations"`
 		}
 		if json.Unmarshal(payload, &parsed) == nil && parsed.Error != "" {
 			return &APIError{
@@ -231,9 +246,13 @@ func (c *Client) post(path string, body any, dest any) error {
 				Code:              parsed.Error,
 				Message:           parsed.Message,
 				AttemptsRemaining: parsed.AttemptsRemaining,
+				Destinations:      parsed.Destinations,
 			}
 		}
 		return fmt.Errorf("enroll %s: %s: %s", path, resp.Status, payload)
+	}
+	if dest == nil {
+		return nil
 	}
 	return json.Unmarshal(payload, dest)
 }

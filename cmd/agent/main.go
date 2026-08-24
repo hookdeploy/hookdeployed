@@ -16,6 +16,7 @@ import (
 	"github.com/hookdeploy/hookdeployed/internal/enroll"
 	"github.com/hookdeploy/hookdeployed/internal/mtls"
 	"github.com/hookdeploy/hookdeployed/internal/store"
+	"github.com/hookdeploy/hookdeployed/internal/tap"
 )
 
 func init() {
@@ -55,6 +56,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "unenroll" {
 		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
 		if err := runUnenroll(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "tap" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		if err := runTap(); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -159,6 +167,68 @@ func runSwitch() error {
 	}
 	tty := enroll.RequireInteractiveFile(os.Stdin) == nil
 	return store.RunSwitch(*dir, fs.Args(), os.Stdin, os.Stdout, tty)
+}
+
+func runTap() error {
+	if len(os.Args) > 1 && os.Args[1] == "list" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		return runTapList()
+	}
+	if len(os.Args) > 1 && os.Args[1] == "stop" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		return runTapStop()
+	}
+	return runTapStart()
+}
+
+func runTapList() error {
+	fs := flag.NewFlagSet("tap list", flag.ExitOnError)
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	return tap.List(tap.Config{
+		Root:      *dir,
+		EnrollURL: *enrollURL,
+		Stdout:    os.Stdout,
+	})
+}
+
+func runTapStop() error {
+	fs := flag.NewFlagSet("tap stop", flag.ExitOnError)
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+	id := strings.Join(fs.Args(), " ")
+	return tap.Stop(tap.Config{
+		Root:      *dir,
+		EnrollURL: *enrollURL,
+		Stdout:    os.Stdout,
+	}, id)
+}
+
+func runTapStart() error {
+	fs := flag.NewFlagSet("tap", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() { fmt.Fprintln(os.Stderr, tap.Usage) }
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker")
+	opts, err := tap.ParseStartFlags(fs, os.Args[1:])
+	if err != nil {
+		return err
+	}
+	tty := enroll.RequireInteractiveFile(os.Stdin) == nil
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return tap.Start(ctx, tap.Config{
+		Root:      *dir,
+		EnrollURL: *enrollURL,
+		TTY:       tty,
+		Stdout:    os.Stdout,
+	}, opts)
 }
 
 func confirmStore(dir string) error {

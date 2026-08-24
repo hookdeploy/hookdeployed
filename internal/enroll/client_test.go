@@ -2,6 +2,7 @@ package enroll
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -229,5 +230,36 @@ func TestPlacementPostsEnforceAndFallback(t *testing.T) {
 	}
 	if out.Reason != "explicit_fallback" || out.RequestedRegion != "us-east" {
 		t.Fatalf("%+v", out)
+	}
+}
+
+func TestAPIErrorParsesAmbiguousDestinations(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(409)
+		_, _ = w.Write([]byte(`{
+			"error":"ambiguous_destination",
+			"message":"Multiple destinations named 'prod' on this endpoint. Specify one by id.",
+			"destinations":[
+				{"id":"dest-a","name":"prod","destination_type":"https"},
+				{"id":"dest-b","name":"prod","destination_type":"agent"}
+			]
+		}`))
+	}))
+	defer srv.Close()
+
+	err := NewClient(srv.URL).Post("/v1/agents/taps", map[string]string{"renewal_token": "x"}, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	var api *APIError
+	if !errors.As(err, &api) {
+		t.Fatalf("err=%v", err)
+	}
+	if api.Code != "ambiguous_destination" || api.Status != 409 {
+		t.Fatalf("%+v", api)
+	}
+	if len(api.Destinations) != 2 || api.Destinations[0].ID != "dest-a" || api.Destinations[1].ID != "dest-b" {
+		t.Fatalf("destinations=%+v", api.Destinations)
 	}
 }
