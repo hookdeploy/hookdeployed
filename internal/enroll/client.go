@@ -62,7 +62,7 @@ type APIError struct {
 	Code              string
 	Message           string
 	AttemptsRemaining int
-	// Destinations is set on 409 ambiguous_destination from tap create.
+	// Destinations is leftover extra JSON from older tap 409s. Unused by tap create now.
 	Destinations []DestinationRef
 }
 
