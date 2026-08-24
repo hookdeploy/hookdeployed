@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,8 +30,10 @@ const (
 	ConnectHint = "Deliveries land only while `agent connect` is running on this machine."
 
 	Usage = `usage: agent tap list
-       agent tap <endpoint-slug> [<dest-name>] -port PORT -path PATH [-duration DUR]
+       agent tap <endpoint-id> <destination-id> -port PORT -path PATH [-duration DUR]
        agent tap stop [id]`
+
+	ErrNotUUID = "doesn't look like a valid id"
 )
 
 type Endpoint struct {
@@ -114,9 +117,6 @@ func wrapAPIError(err error) error {
 	if !errors.As(err, &api) {
 		return err
 	}
-	if api.Code == "ambiguous_destination" {
-		return formatAmbiguous(api)
-	}
 	if api.Message != "" {
 		return fmt.Errorf("%s", api.Message)
 	}
@@ -126,18 +126,17 @@ func wrapAPIError(err error) error {
 	return err
 }
 
-func formatAmbiguous(api *enroll.APIError) error {
-	var b strings.Builder
-	msg := api.Message
-	if msg == "" {
-		msg = "Multiple destinations share that name."
+var uuidRE = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func LooksLikeUUID(value string) bool {
+	return uuidRE.MatchString(strings.TrimSpace(value))
+}
+
+func rejectIfNotUUID(kind, value string) error {
+	if LooksLikeUUID(value) {
+		return nil
 	}
-	fmt.Fprintln(&b, msg)
-	for _, d := range api.Destinations {
-		fmt.Fprintf(&b, "  %s  %s  %s\n", d.ID, d.Name, d.DestinationType)
-	}
-	fmt.Fprint(&b, "The CLI creates taps by destination name. Rename one destination so the name is unique, then retry.")
-	return fmt.Errorf("%s", strings.TrimRight(b.String(), "\n"))
+	return fmt.Errorf("%s %q %s", kind, value, ErrNotUUID)
 }
 
 func fetchTargets(c *enroll.Client, token string) ([]Endpoint, error) {
@@ -166,15 +165,13 @@ func fetchTaps(c *enroll.Client, token string) ([]Tap, error) {
 	return out.Taps, nil
 }
 
-func createTap(c *enroll.Client, token, slug, destName string, port int, path string, durationSeconds *int) (Tap, error) {
+func createTap(c *enroll.Client, token, endpointID, destinationID string, port int, path string, durationSeconds *int) (Tap, error) {
 	body := map[string]any{
-		"renewal_token": token,
-		"endpoint_slug": slug,
-		"target_port":   port,
-		"target_path":   path,
-	}
-	if destName != "" {
-		body["destination_name"] = destName
+		"renewal_token":  token,
+		"endpoint_id":    endpointID,
+		"destination_id": destinationID,
+		"target_port":    port,
+		"target_path":    path,
 	}
 	if durationSeconds != nil {
 		body["duration_seconds"] = *durationSeconds
@@ -253,15 +250,15 @@ func Stop(cfg Config, tapID string) error {
 }
 
 type StartOpts struct {
-	Slug     string
-	DestName string
-	Port     int
-	Path     string
-	Duration time.Duration
+	EndpointID    string
+	DestinationID string
+	Port          int
+	Path          string
+	Duration      time.Duration
 }
 
 func Start(ctx context.Context, cfg Config, opts StartOpts) error {
-	if strings.TrimSpace(opts.Slug) == "" {
+	if strings.TrimSpace(opts.EndpointID) == "" || strings.TrimSpace(opts.DestinationID) == "" {
 		return fmt.Errorf("%s", Usage)
 	}
 	if opts.Port == 0 {
@@ -272,6 +269,12 @@ func Start(ctx context.Context, cfg Config, opts StartOpts) error {
 	}
 	if !strings.HasPrefix(opts.Path, "/") {
 		return fmt.Errorf("Path must start with /.")
+	}
+	if err := rejectIfNotUUID("endpoint id", opts.EndpointID); err != nil {
+		return err
+	}
+	if err := rejectIfNotUUID("destination id", opts.DestinationID); err != nil {
+		return err
 	}
 	if !cfg.TTY {
 		return fmt.Errorf("%s", NeedsTTY)
@@ -289,15 +292,12 @@ func Start(ctx context.Context, cfg Config, opts StartOpts) error {
 		durationSeconds = &sec
 	}
 
-	created, err := createTap(client, tok.Token, opts.Slug, opts.DestName, opts.Port, opts.Path, durationSeconds)
+	created, err := createTap(client, tok.Token, opts.EndpointID, opts.DestinationID, opts.Port, opts.Path, durationSeconds)
 	if err != nil {
 		return err
 	}
 
 	fmt.Fprint(cfg.out(), FormatCreated(opts, created))
-	if opts.DestName == "" {
-		fmt.Fprint(cfg.out(), "This is an endpoint tap. Destination taps are what currently deliver; pass a destination name to receive production HTTPS traffic.\n")
-	}
 	fmt.Fprintln(cfg.out(), ConnectHint)
 	fmt.Fprintln(cfg.out(), "Ctrl+C stops the tap.")
 
@@ -351,10 +351,10 @@ func ParseStartFlags(fs *flag.FlagSet, args []string) (StartOpts, error) {
 		Duration: *duration,
 	}
 	if len(positionals) >= 1 {
-		opts.Slug = positionals[0]
+		opts.EndpointID = positionals[0]
 	}
 	if len(positionals) >= 2 {
-		opts.DestName = strings.Join(positionals[1:], " ")
+		opts.DestinationID = positionals[1]
 	}
 	return opts, nil
 }

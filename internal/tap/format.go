@@ -4,13 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
-)
-
-const (
-	slugWidth = 24
-	destWidth = 48
-	idWidth   = 36
 )
 
 func FormatList(endpoints []Endpoint, taps []Tap) string {
@@ -18,10 +11,20 @@ func FormatList(endpoints []Endpoint, taps []Tap) string {
 	if len(endpoints) == 0 {
 		fmt.Fprintln(&b, "No endpoints in this organization.")
 	} else {
-		fmt.Fprintln(&b, "ENDPOINT                  DESTINATIONS")
-		for _, ep := range endpoints {
-			slug := trunc(displaySlug(ep), slugWidth)
-			fmt.Fprintf(&b, "%-*s  %s\n", slugWidth, slug, formatDestinations(ep.Destinations))
+		for i, ep := range endpoints {
+			if i > 0 {
+				fmt.Fprintln(&b)
+			}
+			fmt.Fprintf(&b, "%s\n", displayName(ep))
+			fmt.Fprintf(&b, "  %s\n", ep.ID)
+			if len(ep.Destinations) == 0 {
+				fmt.Fprintln(&b, "  (no destinations)")
+				continue
+			}
+			for _, d := range ep.Destinations {
+				fmt.Fprintf(&b, "  %s (%s)\n", displayDestName(d), destKind(d))
+				fmt.Fprintf(&b, "    %s\n", d.ID)
+			}
 		}
 	}
 	fmt.Fprintln(&b)
@@ -30,16 +33,10 @@ func FormatList(endpoints []Endpoint, taps []Tap) string {
 		fmt.Fprintln(&b, "  (none)")
 		return b.String()
 	}
-	fmt.Fprintln(&b, "ID                                    ENDPOINT                  DEST            TARGET                           EXPIRES")
 	for _, t := range taps {
-		slug, dest := resolveTapNames(endpoints, t)
-		fmt.Fprintf(&b, "%-*s  %-*s  %-14s  %-32s  %s\n",
-			idWidth, trunc(t.ID, idWidth),
-			slugWidth, trunc(slug, slugWidth),
-			trunc(dest, 14),
-			trunc(formatTarget(t), 32),
-			formatExpires(t.ExpiresAt),
-		)
+		name, dest := resolveTapNames(endpoints, t)
+		fmt.Fprintf(&b, "%s\n", t.ID)
+		fmt.Fprintf(&b, "  %s / %s  %s  %s\n", name, dest, formatTarget(t), formatExpires(t.ExpiresAt))
 	}
 	return b.String()
 }
@@ -50,7 +47,7 @@ func resolveTapNames(endpoints []Endpoint, t Tap) (slug, dest string) {
 		if ep.ID != t.EndpointID {
 			continue
 		}
-		slug = displaySlug(ep)
+		slug = displayName(ep)
 		if t.DestinationID == nil || *t.DestinationID == "" {
 			return slug, dest
 		}
@@ -70,30 +67,28 @@ func resolveTapNames(endpoints []Endpoint, t Tap) (slug, dest string) {
 	return slug, dest
 }
 
-func displaySlug(ep Endpoint) string {
+func displayName(ep Endpoint) string {
+	if strings.TrimSpace(ep.Name) != "" {
+		return ep.Name
+	}
 	if strings.TrimSpace(ep.Slug) != "" {
 		return ep.Slug
 	}
 	return ep.ID
 }
 
-func formatDestinations(dests []Destination) string {
-	if len(dests) == 0 {
-		return "(no destinations)"
+func displayDestName(d Destination) string {
+	if strings.TrimSpace(d.Name) != "" {
+		return d.Name
 	}
-	parts := make([]string, 0, len(dests))
-	for _, d := range dests {
-		name := d.Name
-		if strings.TrimSpace(name) == "" {
-			name = d.ID
-		}
-		kind := d.DestinationType
-		if kind == "" {
-			kind = "https"
-		}
-		parts = append(parts, fmt.Sprintf("%s (%s)", name, kind))
+	return d.ID
+}
+
+func destKind(d Destination) string {
+	if d.DestinationType == "" {
+		return "https"
 	}
-	return trunc(strings.Join(parts, "  "), destWidth)
+	return d.DestinationType
 }
 
 func formatTarget(t Tap) string {
@@ -105,10 +100,6 @@ func formatTarget(t Tap) string {
 }
 
 func FormatCreated(opts StartOpts, created Tap) string {
-	dest := opts.DestName
-	if dest == "" {
-		dest = "(endpoint)"
-	}
 	target := formatTarget(created)
 	if created.TargetPort == 0 {
 		target = fmt.Sprintf("127.0.0.1:%d%s", opts.Port, opts.Path)
@@ -117,7 +108,13 @@ func FormatCreated(opts StartOpts, created Tap) string {
 	if expires == "" {
 		expires = "(server default, max 8h)"
 	}
-	return fmt.Sprintf("Tapping %s / %s → %s\nExpires %s\n", opts.Slug, dest, target, expires)
+	return fmt.Sprintf(
+		"Tapping %s / %s → %s\nExpires %s\n",
+		opts.EndpointID,
+		opts.DestinationID,
+		target,
+		expires,
+	)
 }
 
 func formatExpires(raw string) string {
@@ -131,18 +128,4 @@ func formatExpires(raw string) string {
 		}
 	}
 	return raw
-}
-
-func trunc(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	if utf8.RuneCountInString(s) <= n {
-		return s
-	}
-	if n == 1 {
-		return "…"
-	}
-	runes := []rune(s)
-	return string(runes[:n-1]) + "…"
 }

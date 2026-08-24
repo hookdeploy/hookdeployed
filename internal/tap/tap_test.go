@@ -24,6 +24,12 @@ import (
 )
 
 const testToken = "hd_agentrenew_us_tapfixture"
+const testEndpointID = "11111111-2222-4333-8444-555555555555"
+const testDestID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+func startIDs(port int, path string) StartOpts {
+	return StartOpts{EndpointID: testEndpointID, DestinationID: testDestID, Port: port, Path: path}
+}
 
 func seedActive(t *testing.T, token string) string {
 	t.Helper()
@@ -154,8 +160,14 @@ func TestFormatListRendersEndpointsAndEmptyDestinations(t *testing.T) {
 	if !strings.Contains(out, "orders") {
 		t.Fatalf("missing orders:\n%s", out)
 	}
+	if !strings.Contains(out, "ep-orders") {
+		t.Fatalf("missing endpoint id:\n%s", out)
+	}
 	if !strings.Contains(out, "prod-https (https)") || !strings.Contains(out, "prod-agent (agent)") {
 		t.Fatalf("missing dests:\n%s", out)
+	}
+	if !strings.Contains(out, "dest-https") || !strings.Contains(out, "dest-agent") {
+		t.Fatalf("missing dest ids:\n%s", out)
 	}
 	if !strings.Contains(out, "billing") || !strings.Contains(out, "(no destinations)") {
 		t.Fatalf("empty dests:\n%s", out)
@@ -202,6 +214,9 @@ func TestListCallsBothRoutesAndRenders(t *testing.T) {
 	got := out.String()
 	if !strings.Contains(got, "orders") || !strings.Contains(got, "tap-live") {
 		t.Fatalf("list output:\n%s", got)
+	}
+	if !strings.Contains(got, "ep-orders") {
+		t.Fatalf("endpoint id in list:\n%s", got)
 	}
 	if !strings.Contains(got, "127.0.0.1:3000/hooks/stripe") {
 		t.Fatalf("target:\n%s", got)
@@ -254,7 +269,7 @@ func seedOrgNoActive(t *testing.T, root string) {
 	}
 }
 
-func TestCreateSendsSlugNamePortPathAndToken(t *testing.T) {
+func TestCreateSendsIdsPortPathAndToken(t *testing.T) {
 	root := seedActive(t, testToken)
 	fake := &tapServer{
 		create: map[string]any{"tap": Tap{
@@ -269,6 +284,8 @@ func TestCreateSendsSlugNamePortPathAndToken(t *testing.T) {
 	defer srv.Close()
 
 	var out bytes.Buffer
+	opts := startIDs(3000, "/hooks/stripe")
+	opts.Duration = 2 * time.Hour
 	err := Start(context.Background(), Config{
 		Root:      root,
 		EnrollURL: srv.URL,
@@ -276,7 +293,7 @@ func TestCreateSendsSlugNamePortPathAndToken(t *testing.T) {
 		Stdout:    &out,
 		Client:    enroll.NewClient(srv.URL),
 		Wait:      func(context.Context) error { return nil },
-	}, StartOpts{Slug: "orders", DestName: "prod-https", Port: 3000, Path: "/hooks/stripe", Duration: 2 * time.Hour})
+	}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +301,7 @@ func TestCreateSendsSlugNamePortPathAndToken(t *testing.T) {
 	if body["renewal_token"] != testToken {
 		t.Fatalf("token=%v", body["renewal_token"])
 	}
-	if body["endpoint_slug"] != "orders" || body["destination_name"] != "prod-https" {
+	if body["endpoint_id"] != testEndpointID || body["destination_id"] != testDestID {
 		t.Fatalf("body=%v", body)
 	}
 	if body["target_port"] != float64(3000) || body["target_path"] != "/hooks/stripe" {
@@ -294,7 +311,7 @@ func TestCreateSendsSlugNamePortPathAndToken(t *testing.T) {
 		t.Fatalf("duration=%v", body["duration_seconds"])
 	}
 	printed := out.String()
-	if !strings.Contains(printed, "Tapping orders / prod-https") {
+	if !strings.Contains(printed, "Tapping "+testEndpointID+" / "+testDestID) {
 		t.Fatalf("confirm:\n%s", printed)
 	}
 	if !strings.Contains(printed, "127.0.0.1:3000/hooks/stripe") {
@@ -308,17 +325,28 @@ func TestCreateSendsSlugNamePortPathAndToken(t *testing.T) {
 	}
 }
 
-func TestCreate409RendersBothIds(t *testing.T) {
+func TestMalformedIdRejectedClientSide(t *testing.T) {
+	err := Start(context.Background(), Config{
+		Root:   t.TempDir(),
+		TTY:    true,
+		Stdout: io.Discard,
+		Wait:   func(context.Context) error { return errors.New("must not wait") },
+	}, StartOpts{EndpointID: "orders", DestinationID: testDestID, Port: 3000, Path: "/hooks"})
+	if err == nil || !strings.Contains(err.Error(), ErrNotUUID) {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "endpoint id") {
+		t.Fatalf("should name the field: %v", err)
+	}
+}
+
+func TestWrongIdSurfacesServerError(t *testing.T) {
 	root := seedActive(t, testToken)
 	fake := &tapServer{
 		createErr: &enroll.APIError{
-			Status:  409,
-			Code:    "ambiguous_destination",
-			Message: "Multiple destinations named 'prod' on this endpoint. Specify one by id.",
-			Destinations: []enroll.DestinationRef{
-				{ID: "dest-a", Name: "prod", DestinationType: "https"},
-				{ID: "dest-b", Name: "prod", DestinationType: "agent"},
-			},
+			Status:  404,
+			Code:    "not_found",
+			Message: "No endpoint with that id in this organization.",
 		},
 	}
 	srv := fake.start(t)
@@ -330,20 +358,16 @@ func TestCreate409RendersBothIds(t *testing.T) {
 		TTY:       true,
 		Stdout:    io.Discard,
 		Client:    enroll.NewClient(srv.URL),
-		Wait:      func(context.Context) error { return errors.New("must not wait after 409") },
-	}, StartOpts{Slug: "orders", DestName: "prod", Port: 3000, Path: "/hooks"})
+		Wait:      func(context.Context) error { return errors.New("must not wait after 404") },
+	}, startIDs(3000, "/hooks"))
 	if err == nil {
-		t.Fatal("expected 409")
+		t.Fatal("expected server error")
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "Multiple destinations named 'prod'") {
-		t.Fatalf("message intact: %s", msg)
+	if err.Error() != "No endpoint with that id in this organization." {
+		t.Fatalf("err=%v", err)
 	}
-	if !strings.Contains(msg, "dest-a") || !strings.Contains(msg, "dest-b") {
-		t.Fatalf("both ids: %s", msg)
-	}
-	if !strings.Contains(msg, "Rename one destination") {
-		t.Fatalf("next step: %s", msg)
+	if strings.Contains(err.Error(), ErrNotUUID) {
+		t.Fatal("valid-shaped id must not use the client-side uuid message")
 	}
 }
 
@@ -373,7 +397,7 @@ func TestCtrlCCallsStop(t *testing.T) {
 			stopped = id
 			return nil
 		},
-	}, StartOpts{Slug: "orders", DestName: "prod-https", Port: 3000, Path: "/x"})
+	}, startIDs(3000, "/x"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -405,7 +429,7 @@ func TestFailedStopIsReported(t *testing.T) {
 		Stop: func(token, id string) error {
 			return &enroll.APIError{Status: 502, Code: "upstream", Message: "connection refused"}
 		},
-	}, StartOpts{Slug: "orders", DestName: "prod", Port: 3000, Path: "/"})
+	}, startIDs(3000, "/"))
 	if err == nil {
 		t.Fatal("expected failed stop")
 	}
@@ -436,7 +460,7 @@ func TestNonTTYRefusesBeforeCreate(t *testing.T) {
 			t.Fatal("must not wait")
 			return nil
 		},
-	}, StartOpts{Slug: "orders", DestName: "prod", Port: 3000, Path: "/"})
+	}, startIDs(3000, "/"))
 	if err == nil || err.Error() != NeedsTTY {
 		t.Fatalf("err=%v", err)
 	}
@@ -457,8 +481,9 @@ func TestEveryP1ErrorRendersItsMessage(t *testing.T) {
 		{"unauthorized", 401, "renewal token revoked"},
 		{"unauthorized", 401, "renewal token expired"},
 		{"unauthorized", 401, "agent not found or revoked"},
-		{"bad_request", 400, "endpoint_slug is required"},
-		{"bad_request", 400, "destination_name must be a string"},
+		{"bad_request", 400, "endpoint_id is required"},
+		{"bad_request", 400, "endpoint_id must be a UUID"},
+		{"bad_request", 400, "destination_id must be a UUID"},
 		{"bad_request", 400, "target_port must be an integer"},
 		{"bad_request", 400, "A target port is required."},
 		{"bad_request", 400, "Target port must be an integer between 1 and 65535."},
@@ -466,8 +491,9 @@ func TestEveryP1ErrorRendersItsMessage(t *testing.T) {
 		{"bad_request", 400, "target_path is required"},
 		{"bad_request", 400, "Path must start with /."},
 		{"bad_request", 400, "duration_seconds must be an integer"},
-		{"not_found", 404, "No endpoint named 'missing' in this organization."},
-		{"not_found", 404, "No destination named 'ghost' on this endpoint."},
+		{"not_found", 404, "No endpoint with that id in this organization."},
+		{"not_found", 404, "No destination with that id on this endpoint."},
+		{"bad_request", 400, "That destination does not belong to this endpoint."},
 		{"conflict", 409, "This endpoint already has 5 live taps. Stop one before starting another."},
 		{"bad_request", 400, "This agent is marked production and cannot be a tap target. Use a development agent."},
 		{"not_found", 404, "No such tap."},
@@ -490,7 +516,7 @@ func TestEveryP1ErrorRendersItsMessage(t *testing.T) {
 				TTY:       true,
 				Stdout:    io.Discard,
 				Client:    enroll.NewClient(srv.URL),
-			}, StartOpts{Slug: "orders", DestName: "prod", Port: 3000, Path: "/"})
+			}, startIDs(3000, "/"))
 			if err == nil || err.Error() != tc.message {
 				t.Fatalf("err=%v want %q", err, tc.message)
 			}
@@ -584,11 +610,11 @@ func TestStopAlreadyEndedRendersNoSuchTapUnchanged(t *testing.T) {
 func TestParseStartFlagsAnywhere(t *testing.T) {
 	fs := flag.NewFlagSet("tap", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	opts, err := ParseStartFlags(fs, []string{"orders", "prod-https", "-port", "3000", "-path", "/hooks/stripe", "-duration", "1h"})
+	opts, err := ParseStartFlags(fs, []string{testEndpointID, testDestID, "-port", "3000", "-path", "/hooks/stripe", "-duration", "1h"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opts.Slug != "orders" || opts.DestName != "prod-https" || opts.Port != 3000 || opts.Path != "/hooks/stripe" || opts.Duration != time.Hour {
+	if opts.EndpointID != testEndpointID || opts.DestinationID != testDestID || opts.Port != 3000 || opts.Path != "/hooks/stripe" || opts.Duration != time.Hour {
 		t.Fatalf("%+v", opts)
 	}
 }
@@ -619,7 +645,7 @@ func TestCreateDoesNotRotateToken(t *testing.T) {
 		Stdout:    io.Discard,
 		Client:    enroll.NewClient(srv.URL),
 		Wait:      func(context.Context) error { return nil },
-	}, StartOpts{Slug: "orders", DestName: "prod", Port: 3000, Path: "/"}); err != nil {
+	}, startIDs(3000, "/")); err != nil {
 		t.Fatal(err)
 	}
 	for _, p := range paths {
@@ -630,7 +656,7 @@ func TestCreateDoesNotRotateToken(t *testing.T) {
 }
 
 func TestFormatCreatedUsesServerExpiresAt(t *testing.T) {
-	got := FormatCreated(StartOpts{Slug: "orders", DestName: "prod-https", Port: 3000, Path: "/x"}, Tap{
+	got := FormatCreated(startIDs(3000, "/x"), Tap{
 		TargetPort: 3000,
 		TargetPath: "/x",
 		ExpiresAt:  "2026-08-24T18:00:00Z",
