@@ -325,6 +325,50 @@ func TestCreateSendsIdsPortPathAndToken(t *testing.T) {
 	}
 }
 
+func TestCreateEndpointOnlyOmitsDestinationId(t *testing.T) {
+	root := seedActive(t, testToken)
+	fake := &tapServer{
+		create: map[string]any{"tap": Tap{
+			ID:            "tap-raw",
+			EndpointID:    testEndpointID,
+			DestinationID: nil,
+			TargetPort:    3000,
+			TargetPath:    "/hooks/raw",
+			ExpiresAt:     "2026-08-24T18:00:00Z",
+		}},
+		stop: map[string]any{"tap": Tap{ID: "tap-raw"}},
+	}
+	srv := fake.start(t)
+	defer srv.Close()
+
+	var out bytes.Buffer
+	err := Start(context.Background(), Config{
+		Root:      root,
+		EnrollURL: srv.URL,
+		TTY:       true,
+		Stdout:    &out,
+		Client:    enroll.NewClient(srv.URL),
+		Wait:      func(context.Context) error { return nil },
+	}, StartOpts{EndpointID: testEndpointID, Port: 3000, Path: "/hooks/raw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fake.bodies[CreatePath]
+	if body["endpoint_id"] != testEndpointID {
+		t.Fatalf("endpoint_id=%v", body["endpoint_id"])
+	}
+	if _, ok := body["destination_id"]; ok {
+		t.Fatalf("endpoint-only create must omit destination_id, got %v", body["destination_id"])
+	}
+	printed := out.String()
+	if !strings.Contains(printed, "Tapping "+testEndpointID+" / (endpoint)") {
+		t.Fatalf("confirm:\n%s", printed)
+	}
+	if strings.Contains(printed, "Tapping "+testEndpointID+" /  ") {
+		t.Fatalf("blank dest line:\n%s", printed)
+	}
+}
+
 func TestMalformedIdRejectedClientSide(t *testing.T) {
 	err := Start(context.Background(), Config{
 		Root:   t.TempDir(),
@@ -332,6 +376,21 @@ func TestMalformedIdRejectedClientSide(t *testing.T) {
 		Stdout: io.Discard,
 		Wait:   func(context.Context) error { return errors.New("must not wait") },
 	}, StartOpts{EndpointID: "orders", DestinationID: testDestID, Port: 3000, Path: "/hooks"})
+	if err == nil || !strings.Contains(err.Error(), ErrNotUUID) {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "endpoint id") {
+		t.Fatalf("should name the field: %v", err)
+	}
+}
+
+func TestMalformedEndpointIdRejectedWithoutDestination(t *testing.T) {
+	err := Start(context.Background(), Config{
+		Root:   t.TempDir(),
+		TTY:    true,
+		Stdout: io.Discard,
+		Wait:   func(context.Context) error { return errors.New("must not wait") },
+	}, StartOpts{EndpointID: "orders", Port: 3000, Path: "/hooks"})
 	if err == nil || !strings.Contains(err.Error(), ErrNotUUID) {
 		t.Fatalf("err=%v", err)
 	}
@@ -619,6 +678,18 @@ func TestParseStartFlagsAnywhere(t *testing.T) {
 	}
 }
 
+func TestParseStartFlagsOnePositional(t *testing.T) {
+	fs := flag.NewFlagSet("tap", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opts, err := ParseStartFlags(fs, []string{testEndpointID, "-port", "3000", "-path", "/hooks/raw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.EndpointID != testEndpointID || opts.DestinationID != "" || opts.Port != 3000 || opts.Path != "/hooks/raw" {
+		t.Fatalf("%+v", opts)
+	}
+}
+
 func TestCreateDoesNotRotateToken(t *testing.T) {
 	root := seedActive(t, testToken)
 	var paths []string
@@ -663,6 +734,20 @@ func TestFormatCreatedUsesServerExpiresAt(t *testing.T) {
 	})
 	if !strings.Contains(got, "Expires 2026-08-24 18:00 UTC") {
 		t.Fatalf("%s", got)
+	}
+}
+
+func TestFormatCreatedEndpointOnly(t *testing.T) {
+	got := FormatCreated(StartOpts{EndpointID: testEndpointID, Port: 3000, Path: "/x"}, Tap{
+		TargetPort: 3000,
+		TargetPath: "/x",
+		ExpiresAt:  "2026-08-24T18:00:00Z",
+	})
+	if !strings.Contains(got, "Tapping "+testEndpointID+" / (endpoint) →") {
+		t.Fatalf("%s", got)
+	}
+	if strings.Contains(got, " /  ") {
+		t.Fatalf("blank dest: %s", got)
 	}
 }
 
