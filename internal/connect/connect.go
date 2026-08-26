@@ -28,6 +28,11 @@ const (
 	DefaultRenewInterval = 5 * time.Minute
 	maxBackoff           = 30 * time.Second
 	minBackoff           = time.Second
+	// minHealthySession is how long ServeConn must have run after a
+	// successful handshake before the session counts as healthy for
+	// backoff-reset. A connect that dies in milliseconds is a flap
+	// (accept-then-close), not a stable session that later had a blip.
+	minHealthySession = time.Second
 
 	// localLoopbackHost is the only host a delivery may reach. The port
 	// comes from X-Hd-Target-Port; the host is never read from the request.
@@ -82,6 +87,9 @@ type Config struct {
 	// LocalURL overrides the loopback URL built from X-Hd-Target-Port (tests).
 	// Production leaves this empty so the inbound port is honored.
 	LocalURL string
+	// RenewLoopStarted is called with the session-scoped renewLoop context
+	// (tests). Nil in production.
+	RenewLoopStarted func(ctx context.Context)
 }
 
 // DialSource is how connect decides pin vs placement.
@@ -271,6 +279,33 @@ func NextBackoff(prev time.Duration) time.Duration {
 	return next
 }
 
+// sessionClosedError is returned by dialAndHeartbeat after a successful
+// handshake when ServeConn later returns without a Rejection. Distinct from
+// a dial/TLS failure, which never established a session.
+type sessionClosedError struct {
+	Live time.Duration
+}
+
+func (e *sessionClosedError) Error() string {
+	return "session closed"
+}
+
+// nextSessionRetry decides backoff after a live session ended (not a dial
+// failure). A healthy session (Live >= minHealthySession) wipes the ladder
+// and reconnects immediately. Any established session gets one zero-delay
+// retry; a second consecutive sub-threshold end starts NextBackoff. The
+// immediate retry itself has no floor — the 1s minBackoff on the following
+// failure is what stops a tight loop against an accept-then-close relay.
+func nextSessionRetry(backoff, live time.Duration, usedFree bool) (next time.Duration, immediate bool, nextUsedFree bool) {
+	if live >= minHealthySession {
+		return 0, true, true
+	}
+	if !usedFree {
+		return backoff, true, true
+	}
+	return NextBackoff(backoff), false, false
+}
+
 // IsWakeEvent reports a wall-clock gap much larger than sampleInterval,
 // which typically means the process was suspended. Monotonic readings are
 // stripped with Round(0): time.Since uses the monotonic clock and does not
@@ -333,6 +368,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	backoff := time.Duration(0)
+	usedFree := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
@@ -349,6 +385,7 @@ func Run(ctx context.Context, cfg Config) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			usedFree = false
 			backoff = NextBackoff(backoff)
 			log.Printf("placement failed: %v; retry in %s", err, backoff)
 			select {
@@ -364,6 +401,7 @@ func Run(ctx context.Context, cfg Config) error {
 			}
 			var rej Rejection
 			if errors.As(err, &rej) {
+				usedFree = false
 				if rej.Reason == "draining" {
 					log.Print(DrainingUserMessage)
 					backoff = NextBackoff(backoff)
@@ -376,6 +414,23 @@ func Run(ctx context.Context, cfg Config) error {
 				}
 				return settleRejection(ctx, cfg, rej)
 			}
+			var closed *sessionClosedError
+			if errors.As(err, &closed) {
+				var immediate bool
+				backoff, immediate, usedFree = nextSessionRetry(backoff, closed.Live, usedFree)
+				if immediate {
+					log.Printf("disconnected relay=%s; reconnecting", host)
+					continue
+				}
+				log.Printf("disconnected relay=%s; retry in %s", host, backoff)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			usedFree = false
 			backoff = NextBackoff(backoff)
 			log.Printf("disconnected relay=%s; retry in %s", host, backoff)
 			select {
@@ -416,6 +471,7 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 	}
 	defer conn.Close()
 	log.Printf("connected relay=%s remote=%s", host, conn.RemoteAddr())
+	connectedAt := time.Now()
 
 	sess := &session{
 		cfg:    cfg,
@@ -433,7 +489,9 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 	}()
 	defer close(done)
 
-	go sess.renewLoop(ctx, cfg)
+	sessCtx, sessCancel := context.WithCancel(ctx)
+	defer sessCancel()
+	go sess.renewLoop(sessCtx, cfg)
 
 	// IdleTimeout must stay zero: HTTP/2 PING does not count as activity,
 	// so a short IdleTimeout would GOAWAY a quiet agent. Liveness is the
@@ -454,7 +512,7 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 	default:
 	}
 	log.Printf("heartbeat dropped relay=%s", host)
-	return fmt.Errorf("session closed")
+	return &sessionClosedError{Live: time.Since(connectedAt)}
 }
 
 func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {

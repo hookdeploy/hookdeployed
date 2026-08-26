@@ -274,6 +274,9 @@ func copyHeaders(dst, src http.Header) {
 }
 
 func (s *session) renewLoop(ctx context.Context, cfg Config) {
+	if cfg.RenewLoopStarted != nil {
+		cfg.RenewLoopStarted(ctx)
+	}
 	pingEvery := cfg.PingInterval
 	if pingEvery <= 0 {
 		pingEvery = DefaultPingInterval
