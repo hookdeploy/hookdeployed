@@ -15,8 +15,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"strconv"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,6 +69,91 @@ func TestNextBackoff(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("backoff[%d]=%s want %s (all=%v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestNextSessionRetry(t *testing.T) {
+	cases := []struct {
+		name          string
+		backoff       time.Duration
+		live          time.Duration
+		usedFree      bool
+		wantBackoff   time.Duration
+		wantImmediate bool
+		wantUsedFree  bool
+	}{
+		{
+			name:          "healthy wipes accumulated backoff and retries immediately",
+			backoff:       8 * time.Second,
+			live:          minHealthySession,
+			usedFree:      false,
+			wantBackoff:   0,
+			wantImmediate: true,
+			wantUsedFree:  true,
+		},
+		{
+			name:          "healthy after free retry still immediate and still zero",
+			backoff:       4 * time.Second,
+			live:          minHealthySession + time.Millisecond,
+			usedFree:      true,
+			wantBackoff:   0,
+			wantImmediate: true,
+			wantUsedFree:  true,
+		},
+		{
+			name:          "first short session keeps backoff and is free immediate retry",
+			backoff:       4 * time.Second,
+			live:          time.Millisecond,
+			usedFree:      false,
+			wantBackoff:   4 * time.Second,
+			wantImmediate: true,
+			wantUsedFree:  true,
+		},
+		{
+			name:          "second short session escalates from current backoff",
+			backoff:       0,
+			live:          time.Millisecond,
+			usedFree:      true,
+			wantBackoff:   time.Second,
+			wantImmediate: false,
+			wantUsedFree:  false,
+		},
+		{
+			name:          "second short session doubles existing ladder",
+			backoff:       4 * time.Second,
+			live:          minHealthySession - time.Nanosecond,
+			usedFree:      true,
+			wantBackoff:   8 * time.Second,
+			wantImmediate: false,
+			wantUsedFree:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next, immediate, used := nextSessionRetry(tc.backoff, tc.live, tc.usedFree)
+			if next != tc.wantBackoff || immediate != tc.wantImmediate || used != tc.wantUsedFree {
+				t.Fatalf("nextSessionRetry(%s, %s, %v)=(%s, %v, %v) want (%s, %v, %v)",
+					tc.backoff, tc.live, tc.usedFree,
+					next, immediate, used,
+					tc.wantBackoff, tc.wantImmediate, tc.wantUsedFree)
+			}
+		})
+	}
+}
+
+func TestSessionClosedErrorDistinctFromDial(t *testing.T) {
+	closed := &sessionClosedError{Live: time.Second}
+	if !errors.As(closed, new(*sessionClosedError)) {
+		t.Fatal("sessionClosedError must match errors.As")
+	}
+	dial := fmt.Errorf("dial tcp: connection refused")
+	var sc *sessionClosedError
+	if errors.As(dial, &sc) {
+		t.Fatal("dial error must not be sessionClosedError")
+	}
+	var rej Rejection
+	if errors.As(closed, &rej) {
+		t.Fatal("session closed must not be a Rejection")
 	}
 }
 
@@ -1724,4 +1809,3 @@ func TestUnparseableTargetPortFailsDistinctly(t *testing.T) {
 		}
 	}
 }
-
