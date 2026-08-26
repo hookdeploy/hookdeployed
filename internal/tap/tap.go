@@ -30,7 +30,7 @@ const (
 	ConnectHint = "Deliveries land only while `agent connect` is running on this machine."
 
 	Usage = `usage: agent tap list
-       agent tap <endpoint-id> <destination-id> -port PORT -path PATH [-duration DUR]
+       agent tap <endpoint-id> [<destination-id>] -port PORT -path PATH [-duration DUR]
        agent tap stop [id]`
 
 	ErrNotUUID = "doesn't look like a valid id"
@@ -167,11 +167,16 @@ func fetchTaps(c *enroll.Client, token string) ([]Tap, error) {
 
 func createTap(c *enroll.Client, token, endpointID, destinationID string, port int, path string, durationSeconds *int) (Tap, error) {
 	body := map[string]any{
-		"renewal_token":  token,
-		"endpoint_id":    endpointID,
-		"destination_id": destinationID,
-		"target_port":    port,
-		"target_path":    path,
+		"renewal_token": token,
+		"endpoint_id":   endpointID,
+		"target_port":   port,
+		"target_path":   path,
+	}
+	// Omit destination_id for an endpoint-only tap. Enrollment's optionalUuid
+	// treats a missing key the same as null/"" — omission is the idiomatic
+	// Go map build and never sends an empty string the server must ignore.
+	if dest := strings.TrimSpace(destinationID); dest != "" {
+		body["destination_id"] = dest
 	}
 	if durationSeconds != nil {
 		body["duration_seconds"] = *durationSeconds
@@ -258,7 +263,9 @@ type StartOpts struct {
 }
 
 func Start(ctx context.Context, cfg Config, opts StartOpts) error {
-	if strings.TrimSpace(opts.EndpointID) == "" || strings.TrimSpace(opts.DestinationID) == "" {
+	opts.EndpointID = strings.TrimSpace(opts.EndpointID)
+	opts.DestinationID = strings.TrimSpace(opts.DestinationID)
+	if opts.EndpointID == "" {
 		return fmt.Errorf("%s", Usage)
 	}
 	if opts.Port == 0 {
@@ -273,8 +280,10 @@ func Start(ctx context.Context, cfg Config, opts StartOpts) error {
 	if err := rejectIfNotUUID("endpoint id", opts.EndpointID); err != nil {
 		return err
 	}
-	if err := rejectIfNotUUID("destination id", opts.DestinationID); err != nil {
-		return err
+	if opts.DestinationID != "" {
+		if err := rejectIfNotUUID("destination id", opts.DestinationID); err != nil {
+			return err
+		}
 	}
 	if !cfg.TTY {
 		return fmt.Errorf("%s", NeedsTTY)

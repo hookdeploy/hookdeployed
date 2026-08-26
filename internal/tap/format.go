@@ -108,10 +108,14 @@ func FormatCreated(opts StartOpts, created Tap) string {
 	if expires == "" {
 		expires = "(server default, max 8h)"
 	}
+	dest := strings.TrimSpace(opts.DestinationID)
+	if dest == "" {
+		dest = "(endpoint)"
+	}
 	return fmt.Sprintf(
 		"Tapping %s / %s → %s\nExpires %s\n",
 		opts.EndpointID,
-		opts.DestinationID,
+		dest,
 		target,
 		expires,
 	)
