@@ -217,10 +217,14 @@ package-managed path. (`install.sh` still writes
 
 ### `hookdeployed.templates` + `hookdeployed.config`
 
-`Type: password`, empty default. Config does
-`db_input medium hookdeployed/enroll_token` so a normal `apt install`
-(priority **high**) **does not prompt**. Preseed or
-`dpkg-reconfigure` / medium frontend still can.
+`Type: string`, empty default. Config does
+`db_get` first and only `db_input medium` when the value is empty, so a
+preseeded token is never sent through a frontend widget. A normal
+`apt install` (priority **high**) **does not prompt**. `string` rather
+than `password`: real tokens are 77–79 characters (`hd_enroll_<region>_`
++ 64 hex) and password-type fields/widgets have historically truncated
+or rewritten values; this field is meant for unattended preseed, not
+interactive secret entry (`dpkg-reconfigure` will echo the token).
 
 ### `postinst`
 
@@ -230,8 +234,9 @@ Sources `/usr/share/hookdeployed/install-common.sh` (shipped in the
 1. `ensure_user` + `ensure_state_dirs`
 2. `systemctl daemon-reload`
 3. Token from `HOOKDEPLOYED_TOKEN` or debconf `hookdeployed/enroll_token`
-4. Token present → `enroll_with_token /usr/bin/hookdeployed` then clear
-   the debconf value
+4. Token present → `enroll_with_token /usr/bin/hookdeployed`. Success
+   clears the debconf value. Failure is logged and falls through to
+   manual-enroll instructions — **never a dpkg error**.
 5. Else if already enrolled **and** unit enabled → `restart` (upgrade)
 6. Else → `print_no_token_instructions /usr/bin/hookdeployed` with an
    apt-specific unattended hint (preseed / `HOOKDEPLOYED_TOKEN`)
