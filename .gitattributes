@@ -1,0 +1,4 @@
+.gitattributes text eol=lf
+install.sh text eol=lf
+packaging/*.service text eol=lf
+.github/workflows/*.yml text eol=lf

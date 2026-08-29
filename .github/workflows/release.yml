@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Go
+        uses: actions/setup-go@v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Derive version
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          case "${TAG}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "tag ${TAG} is not vMAJOR.MINOR.PATCH" >&2
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#v}"
+          if [ -z "${VERSION}" ] || [ "${VERSION}" = "${TAG}" ]; then
+            echo "could not strip v from ${TAG}" >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cross-compile and package
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Single-job shell loop (not strategy.matrix): one workspace so
+          # SHA256SUMS and gh release create see every asset without a
+          # fan-in job. Each target is seconds under CGO_ENABLED=0.
+          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
+          mkdir -p dist
+          ldflags="-X github.com/hookdeploy/hookdeployed/internal/version.Version=${VERSION}"
+          for spec in ${targets}; do
+            goos="${spec%/*}"
+            goarch="${spec#*/}"
+            echo "==> ${goos}/${goarch}"
+            bin="hookdeployed"
+            if [ "${goos}" = "windows" ]; then
+              bin="hookdeployed.exe"
+            fi
+            out="dist/build/${goos}-${goarch}"
+            mkdir -p "${out}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build -ldflags "${ldflags}" -o "${out}/${bin}" ./cmd/agent
+            archive="dist/hookdeployed_${TAG}_${goos}_${goarch}.tar.gz"
+            tar -C "${out}" -czf "${archive}" "${bin}"
+            echo "    ${archive}"
+          done
+          # Windows stays .tar.gz this pass: those assets are for internal
+          # testing only (install.sh is Linux-only). One archive type keeps
+          # SHA256SUMS and install.sh extraction identical.
+          (cd dist && sha256sum hookdeployed_*.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --generate-notes \
+            dist/hookdeployed_*.tar.gz \
+            dist/SHA256SUMS

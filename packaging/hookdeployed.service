@@ -1,0 +1,22 @@
+[Unit]
+Description=HookDeploy delivery agent
+Documentation=https://github.com/hookdeploy/hookdeployed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hookdeployed
+Group=hookdeployed
+Environment=HOOKDEPLOY_CERT_DIR=/var/lib/hookdeployed/certs
+ExecStart=/usr/local/bin/hookdeployed connect
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=30
+StartLimitBurst=5
+# In-process reconnect already covers network blips. Restart only if
+# the process actually exits (crash, fatal enroll/cert error).
+# Restart=always would relaunch a clean exit after revoke.
+
+[Install]
+WantedBy=multi-user.target
