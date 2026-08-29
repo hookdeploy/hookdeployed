@@ -92,6 +92,42 @@ func TestPostinstEnrollFailureDoesNotFailPackage(t *testing.T) {
 	}
 }
 
+func TestAptInstallShIndependentOfTarballInstaller(t *testing.T) {
+	apt := readRepo(t, "packaging/apt-install.sh")
+	tarball := readRepo(t, "install.sh")
+	for _, forbidden := range []string{
+		"install-common.sh",
+		"api.github.com/repos",
+		"/usr/local/bin",
+		"enroll_with_token",
+	} {
+		if strings.Contains(apt, forbidden) {
+			t.Fatalf("apt-install.sh must not share tarball-installer internals (%q)", forbidden)
+		}
+	}
+	if !strings.Contains(apt, "TOKEN=\"${HOOKDEPLOYED_TOKEN:-}\"") {
+		t.Fatal("apt-install.sh must default TOKEN from HOOKDEPLOYED_TOKEN like install.sh")
+	}
+	if !strings.Contains(apt, `TOKEN="$2"`) || !strings.Contains(apt, `TOKEN="${1#--token=}"`) {
+		t.Fatal("apt-install.sh must parse --token / --token= the same way as install.sh (flag overwrites env)")
+	}
+	if !strings.Contains(tarball, `TOKEN="${HOOKDEPLOYED_TOKEN:-}"`) || !strings.Contains(tarball, `TOKEN="$2"`) {
+		t.Fatal("repo-root install.sh token precedence changed; do not invent a new convention")
+	}
+	if !strings.Contains(apt, `tr -d '\r\n'`) {
+		t.Fatal("apt-install.sh must strip CR/LF before debconf-set-selections")
+	}
+	if !strings.Contains(apt, "hookdeployed/enroll_token string") {
+		t.Fatal("preseed must use Type: string")
+	}
+	if !strings.Contains(apt, "[ -t 0 ]") {
+		t.Fatal("must detect a TTY with [ -t 0 ]")
+	}
+	if !strings.Contains(apt, "read -rp") {
+		t.Fatal("TTY path must prompt with read -rp")
+	}
+}
+
 func TestInstallShTokenPathUnchanged(t *testing.T) {
 	inst := readRepo(t, "install.sh")
 	for _, want := range []string{
@@ -199,7 +235,7 @@ func TestEnrollBehavior(t *testing.T) {
 	if bash == "" {
 		t.Skip("usable bash not available")
 	}
-	for _, name := range []string{"enroll_behavior_test.sh", "debconf_desync_test.sh"} {
+	for _, name := range []string{"enroll_behavior_test.sh", "debconf_desync_test.sh", "apt_install_test.sh"} {
 		script := filepath.Join(packagingDir(t), "lib", name)
 		cmd := exec.Command(bash, script)
 		cmd.Dir = filepath.Dir(packagingDir(t))
