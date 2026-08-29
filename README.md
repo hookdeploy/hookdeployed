@@ -182,6 +182,6 @@ Questions about licensing or alternative arrangements: **support@hookdeploy.dev*
 
 ## Support
 
-- Docs: [docs.hookdeploy.dev](https://docs.hookdeploy.dev)
+- Docs: [hookdeploy.dev/docs](https://hookdeploy.dev/docs)
 - Dashboard: [app.hookdeploy.dev](https://app.hookdeploy.dev)
 - Email: support@hookdeploy.dev
