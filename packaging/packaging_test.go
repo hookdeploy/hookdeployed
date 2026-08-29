@@ -50,6 +50,27 @@ func TestProductionTokenLongerThanPasswordWidgetLimit(t *testing.T) {
 	}
 }
 
+func TestPostinstSourcesConfmoduleBeforeAnyStdout(t *testing.T) {
+	postinst := readRepo(t, "packaging/debian/postinst")
+	conf := strings.Index(postinst, ". /usr/share/debconf/confmodule")
+	if conf < 0 {
+		t.Fatal("postinst must source confmodule")
+	}
+	// Anything that writes to stdout before this source desynchronizes db_get
+	// on the frontend re-exec (see packaging/lib/debconf_desync_test.sh).
+	ensure := strings.Index(postinst, "ensure_user")
+	common := strings.Index(postinst, ". \"${COMMON}\"")
+	if ensure < 0 || common < 0 {
+		t.Fatal("postinst missing ensure_user or COMMON source")
+	}
+	if conf > ensure || conf > common {
+		t.Fatal("confmodule must be sourced before COMMON/ensure_user — those log to stdout")
+	}
+	if !strings.HasPrefix(strings.TrimSpace(postinst), "#!/bin/sh") {
+		t.Fatal("unexpected postinst shebang")
+	}
+}
+
 func TestPostinstEnrollFailureDoesNotFailPackage(t *testing.T) {
 	postinst := readRepo(t, "packaging/debian/postinst")
 	if !strings.Contains(postinst, "if enroll_with_token /usr/bin/hookdeployed") {
@@ -123,6 +144,38 @@ func TestEnrollWithTokenPassesQuotedTrimmedTokenAndDoesNotDie(t *testing.T) {
 	}
 }
 
+func TestDebconfProtocolDesyncStealsTokenReply(t *testing.T) {
+	// Models Debian confmodule's 1:1 command/reply on the protocol pipe.
+	// A stdout log line before sourcing confmodule is read as a command;
+	// db_get then consumes that error reply. The stored token is never read.
+	// Worker parseTokenRegion fails → 401 "invalid token".
+	const good = "hd_enroll_us_" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	frontend := func(cmd string) string {
+		if strings.HasPrefix(cmd, "GET") {
+			return "0 " + good
+		}
+		return "20 not-a-command"
+	}
+	strip := func(line string) string {
+		if len(line) >= 2 && line[0] != ' ' && line[1] == ' ' {
+			return line[2:]
+		}
+		return line
+	}
+	stolen := strip(frontend("hookdeployed: user hookdeployed already exists"))
+	_ = frontend("GET hookdeployed/enroll_token") // unread, like the real pipe
+	fixed := strip(frontend("GET hookdeployed/enroll_token"))
+	if stolen == good {
+		t.Fatal("polluted protocol should not yield the stored token")
+	}
+	if strings.HasPrefix(stolen, "hd_enroll_") {
+		t.Fatalf("stolen RET still looks like a token: %q", stolen)
+	}
+	if fixed != good {
+		t.Fatalf("clean GET should return the stored token, got %q", fixed)
+	}
+}
+
 func TestMangledTokenStillLooksValidToWorkerPrefix(t *testing.T) {
 	// enrollment-worker parseTokenRegion: prefix match OR hash miss → 401 "invalid token".
 	// A truncated or CR-suffixed token still matches the prefix, so the agent
@@ -146,15 +199,17 @@ func TestEnrollBehavior(t *testing.T) {
 	if bash == "" {
 		t.Skip("usable bash not available")
 	}
-	script := filepath.Join(packagingDir(t), "lib", "enroll_behavior_test.sh")
-	cmd := exec.Command(bash, script)
-	cmd.Dir = filepath.Dir(packagingDir(t))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("enroll_behavior_test.sh: %v\n%s", err, out)
-	}
-	if !strings.Contains(string(out), "ok") {
-		t.Fatalf("unexpected output:\n%s", out)
+	for _, name := range []string{"enroll_behavior_test.sh", "debconf_desync_test.sh"} {
+		script := filepath.Join(packagingDir(t), "lib", name)
+		cmd := exec.Command(bash, script)
+		cmd.Dir = filepath.Dir(packagingDir(t))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", name, err, out)
+		}
+		if !strings.Contains(string(out), "ok") {
+			t.Fatalf("%s unexpected output:\n%s", name, out)
+		}
 	}
 }
 

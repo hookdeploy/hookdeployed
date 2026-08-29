@@ -1,6 +1,17 @@
 #!/bin/sh
 set -e
 
+# Source confmodule BEFORE any stdout (log/echo/printf). When dpkg runs this
+# script through the debconf frontend — or when sourcing confmodule re-execs
+# us under one — stdout is the protocol pipe. Text written there is parsed as
+# a command; the frontend replies to it; the next db_get then reads that
+# reply instead of the token. The stored debconf value is fine (debconf-show
+# matches the token that works by hand); RET is not. That mangled argv is
+# what the worker rejects as "invalid token".
+if [ -f /usr/share/debconf/confmodule ]; then
+  . /usr/share/debconf/confmodule
+fi
+
 # Binary and unit are already on disk (dpkg data tar):
 #   /usr/bin/hookdeployed
 #   /usr/lib/systemd/system/hookdeployed.service
@@ -22,8 +33,7 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 TOKEN="${HOOKDEPLOYED_TOKEN:-}"
-if [ -z "${TOKEN}" ] && [ -f /usr/share/debconf/confmodule ]; then
-  . /usr/share/debconf/confmodule
+if [ -z "${TOKEN}" ] && type db_get >/dev/null 2>&1; then
   db_get hookdeployed/enroll_token || true
   TOKEN="${RET:-}"
 fi
@@ -36,8 +46,7 @@ case "$1" in
       # Enroll failure must not fail the package. Binary, unit, and user
       # are already on disk; a bad token or network error is not a dpkg error.
       if enroll_with_token /usr/bin/hookdeployed "${TOKEN}"; then
-        if [ -f /usr/share/debconf/confmodule ]; then
-          . /usr/share/debconf/confmodule
+        if type db_set >/dev/null 2>&1; then
           db_set hookdeployed/enroll_token "" || true
           db_fset hookdeployed/enroll_token seen false || true
         fi
