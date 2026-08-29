@@ -1,6 +1,6 @@
 # hookdeployed
 
-**The HookDeploy agent.** A small, single-binary client that receives your production webhooks on
+**The HookDeploy mTLS webhook delivery agent.** A small, single-binary client that receives your production webhooks on
 your own machine — your laptop, a staging box, a server behind a firewall — without opening a single
 inbound port.
 
