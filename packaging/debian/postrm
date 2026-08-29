@@ -1,0 +1,30 @@
+#!/bin/sh
+set -e
+
+_disable_unit() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop hookdeployed.service || true
+    systemctl disable hookdeployed.service || true
+    systemctl daemon-reload || true
+  fi
+}
+
+case "$1" in
+  remove)
+    # Leave /var/lib/hookdeployed (certs) so a later reinstall can reconnect.
+    _disable_unit
+    ;;
+  purge)
+    _disable_unit
+    rm -rf /var/lib/hookdeployed
+    if id -u hookdeployed >/dev/null 2>&1; then
+      userdel hookdeployed || true
+    fi
+    if [ -f /usr/share/debconf/confmodule ]; then
+      . /usr/share/debconf/confmodule
+      db_purge || true
+    fi
+    ;;
+esac
+
+exit 0

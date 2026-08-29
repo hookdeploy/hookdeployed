@@ -1,0 +1,17 @@
+Package: hookdeployed
+Version: __VERSION__
+Architecture: __ARCH__
+Maintainer: HookDeploy <support@hookdeploy.dev>
+Installed-Size: __INSTALLED_SIZE__
+Depends: adduser, debconf (>= 0.5)
+Recommends: ca-certificates
+Section: net
+Priority: optional
+Homepage: https://github.com/hookdeploy/hookdeployed
+Description: HookDeploy mTLS webhook delivery agent
+ Single-binary client that dials out to HookDeploy's relay network over
+ mutual TLS and delivers webhooks to localhost. No inbound ports.
+ .
+ Default apt install places the binary and systemd unit but does not
+ start the service. Enroll in a terminal, or preseed
+ hookdeployed/enroll_token for unattended enroll and start.
