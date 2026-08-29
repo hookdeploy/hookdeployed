@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+# Stop before the unit file is removed (postrm is too late for a clean stop).
+case "$1" in
+  remove|upgrade|deconfigure)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop hookdeployed.service || true
+    fi
+    ;;
+esac
+exit 0

@@ -1,0 +1,51 @@
+#!/bin/sh
+set -e
+
+# Binary and unit are already on disk (dpkg data tar):
+#   /usr/bin/hookdeployed
+#   /usr/lib/systemd/system/hookdeployed.service
+# This script never downloads anything.
+
+COMMON=/usr/share/hookdeployed/install-common.sh
+# During local package tests the helper may still be next to this script.
+if [ ! -f "${COMMON}" ] && [ -n "${HOOKDEPLOYED_INSTALL_COMMON:-}" ]; then
+  COMMON="${HOOKDEPLOYED_INSTALL_COMMON}"
+fi
+# shellcheck source=../lib/install-common.sh
+. "${COMMON}"
+
+ensure_user
+ensure_state_dirs
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload || true
+fi
+
+TOKEN="${HOOKDEPLOYED_TOKEN:-}"
+if [ -z "${TOKEN}" ] && [ -f /usr/share/debconf/confmodule ]; then
+  . /usr/share/debconf/confmodule
+  db_get hookdeployed/enroll_token || true
+  TOKEN="${RET:-}"
+fi
+
+case "$1" in
+  configure)
+    if [ -n "${TOKEN}" ]; then
+      enroll_with_token /usr/bin/hookdeployed "${TOKEN}"
+      if [ -f /usr/share/debconf/confmodule ]; then
+        . /usr/share/debconf/confmodule
+        db_set hookdeployed/enroll_token "" || true
+        db_fset hookdeployed/enroll_token seen false || true
+      fi
+    elif already_enrolled && command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-enabled hookdeployed.service >/dev/null 2>&1; then
+      # Upgrade of an already-enrolled, enabled install: pick up the new binary.
+      systemctl restart hookdeployed.service || true
+    else
+      print_no_token_instructions /usr/bin/hookdeployed \
+        "For unattended install, preseed hookdeployed/enroll_token or set HOOKDEPLOYED_TOKEN."
+    fi
+    ;;
+esac
+
+exit 0

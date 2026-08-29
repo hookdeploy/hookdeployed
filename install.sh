@@ -8,9 +8,6 @@ set -euo pipefail
 REPO="${HOOKDEPLOYED_REPO:-hookdeploy/hookdeployed}"
 BIN_NAME="hookdeployed"
 INSTALL_PATH="/usr/local/bin/${BIN_NAME}"
-SERVICE_USER="hookdeployed"
-CERT_DIR="/var/lib/hookdeployed/certs"
-STATE_DIR="/var/lib/hookdeployed"
 UNIT_PATH="/etc/systemd/system/hookdeployed.service"
 RELEASES_API="https://api.github.com/repos/${REPO}/releases"
 
@@ -53,6 +50,140 @@ run() {
   fi
   "$@"
 }
+
+# Shared user/certs/enroll helpers. Checkout → source the file. curl | bash
+# has no sibling tree, so the same file is inlined below. Keep the two copies
+# identical to packaging/lib/install-common.sh.
+_load_install_common() {
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    local dir
+    dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${dir}/packaging/lib/install-common.sh" ]; then
+      # shellcheck source=packaging/lib/install-common.sh
+      . "${dir}/packaging/lib/install-common.sh"
+      return
+    fi
+  fi
+  # Fallback for piped install (curl | bash). Heredoc is attached to this
+  # command — it does not consume the script's stdin pipe.
+  # BEGIN packaging/lib/install-common.sh
+  . /dev/stdin <<'INSTALL_COMMON'
+# Shared install helpers for install.sh and the Debian postinst.
+# Do not run this file directly — source it.
+#
+# Caller may define log, die, run, DRY_RUN before sourcing. If those are
+# missing, this file provides defaults (run is a passthrough; DRY_RUN=0).
+
+SERVICE_USER="${SERVICE_USER:-hookdeployed}"
+CERT_DIR="${CERT_DIR:-/var/lib/hookdeployed/certs}"
+STATE_DIR="${STATE_DIR:-/var/lib/hookdeployed}"
+
+if ! type log >/dev/null 2>&1; then
+  log() { printf 'hookdeployed: %s\n' "$*"; }
+fi
+if ! type die >/dev/null 2>&1; then
+  die() { printf 'hookdeployed: %s\n' "$*" >&2; exit 1; }
+fi
+if ! type run >/dev/null 2>&1; then
+  run() { "$@"; }
+fi
+
+ensure_user() {
+  if id -u "${SERVICE_USER}" >/dev/null 2>&1; then
+    log "user ${SERVICE_USER} already exists"
+    return
+  fi
+  local shell=""
+  for cand in /usr/sbin/nologin /sbin/nologin /bin/false; do
+    if [ -x "${cand}" ]; then
+      shell="${cand}"
+      break
+    fi
+  done
+  [ -n "${shell}" ] || die "no nologin/false shell found"
+  run useradd --system --no-create-home --home-dir "${STATE_DIR}" --shell "${shell}" "${SERVICE_USER}"
+}
+
+ensure_state_dirs() {
+  run mkdir -p "${CERT_DIR}"
+  if [ "${DRY_RUN:-0}" -eq 0 ]; then
+    chown "${SERVICE_USER}:${SERVICE_USER}" "${STATE_DIR}" "${CERT_DIR}"
+    chmod 0755 "${STATE_DIR}"
+    chmod 0700 "${CERT_DIR}"
+  else
+    log "dry-run: chown ${SERVICE_USER} ${STATE_DIR} ${CERT_DIR}; chmod 0755/0700"
+  fi
+}
+
+already_enrolled() {
+  local active key
+  [ -f "${CERT_DIR}/active" ] || return 1
+  active="$(tr -d '[:space:]' < "${CERT_DIR}/active")"
+  [ -n "${active}" ] || return 1
+  key="${CERT_DIR}/${active}/client.key"
+  [ -f "${key}" ]
+}
+
+# Run enroll as SERVICE_USER. Prefers sudo -u (install.sh path) so the
+# exact command is unchanged; runuser/su are for maintainer scripts.
+_enroll_as_service_user() {
+  local bin_path="$1"
+  local token="$2"
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -u "${SERVICE_USER}" env HOOKDEPLOY_CERT_DIR="${CERT_DIR}" "${bin_path}" enroll -token "${token}"
+  elif command -v runuser >/dev/null 2>&1; then
+    runuser -u "${SERVICE_USER}" -- env HOOKDEPLOY_CERT_DIR="${CERT_DIR}" "${bin_path}" enroll -token "${token}"
+  else
+    su -s /bin/sh "${SERVICE_USER}" -c "env HOOKDEPLOY_CERT_DIR=${CERT_DIR} ${bin_path} enroll -token ${token}"
+  fi
+}
+
+enroll_with_token() {
+  local bin_path="$1"
+  local token="$2"
+  local enroll_ec
+  log "enrolling as ${SERVICE_USER} (HOOKDEPLOY_CERT_DIR=${CERT_DIR})"
+  set +e
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    run sudo -u "${SERVICE_USER}" env HOOKDEPLOY_CERT_DIR="${CERT_DIR}" "${bin_path}" enroll -token "${token}"
+    enroll_ec=0
+  else
+    _enroll_as_service_user "${bin_path}" "${token}"
+    enroll_ec=$?
+  fi
+  set -e
+  if [ "${enroll_ec}" -ne 0 ]; then
+    if already_enrolled; then
+      log "enroll failed (exit ${enroll_ec}); existing credentials kept — same token is one-time and cannot be reused"
+    else
+      die "enroll failed (exit ${enroll_ec}) and no usable credentials in ${CERT_DIR}"
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl enable --now hookdeployed
+    # Pick up creds if the unit was already running from a prior install.
+    run systemctl restart hookdeployed
+  fi
+}
+
+# $1 = binary path printed in the enroll command
+# $2 = optional unattended-hint sentence (default matches install.sh)
+print_no_token_instructions() {
+  local bin_path="$1"
+  local unattended_hint="${2:-For unattended install, re-run with --token.}"
+  log "no token given — service is not enabled (connect needs credentials)."
+  log "In a real terminal, enroll then start:"
+  cat <<EOF
+  sudo -u ${SERVICE_USER} env HOOKDEPLOY_CERT_DIR=${CERT_DIR} ${bin_path} enroll
+  sudo systemctl enable --now hookdeployed
+EOF
+  log "Do not pipe that enroll command: device-code needs a TTY. ${unattended_hint}"
+}
+INSTALL_COMMON
+  # END packaging/lib/install-common.sh
+}
+
+_load_install_common
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -169,31 +300,6 @@ WantedBy=multi-user.target
 UNIT
 }
 
-ensure_user() {
-  if id -u "${SERVICE_USER}" >/dev/null 2>&1; then
-    log "user ${SERVICE_USER} already exists"
-    return
-  fi
-  local shell=""
-  for cand in /usr/sbin/nologin /sbin/nologin /bin/false; do
-    if [ -x "${cand}" ]; then
-      shell="${cand}"
-      break
-    fi
-  done
-  [ -n "${shell}" ] || die "no nologin/false shell found"
-  run useradd --system --no-create-home --home-dir "${STATE_DIR}" --shell "${shell}" "${SERVICE_USER}"
-}
-
-already_enrolled() {
-  local active key
-  [ -f "${CERT_DIR}/active" ] || return 1
-  active="$(tr -d '[:space:]' < "${CERT_DIR}/active")"
-  [ -n "${active}" ] || return 1
-  key="${CERT_DIR}/${active}/client.key"
-  [ -f "${key}" ]
-}
-
 TAG="$(resolve_tag)"
 ASSET="hookdeployed_${TAG}_linux_${GOARCH}.tar.gz"
 DOWNLOAD_BASE="https://github.com/${REPO}/releases/download/${TAG}"
@@ -230,14 +336,7 @@ else
 fi
 
 ensure_user
-run mkdir -p "${CERT_DIR}"
-if [ "${DRY_RUN}" -eq 0 ]; then
-  chown "${SERVICE_USER}:${SERVICE_USER}" "${STATE_DIR}" "${CERT_DIR}"
-  chmod 0755 "${STATE_DIR}"
-  chmod 0700 "${CERT_DIR}"
-else
-  log "dry-run: chown ${SERVICE_USER} ${STATE_DIR} ${CERT_DIR}; chmod 0755/0700"
-fi
+ensure_state_dirs
 
 write_unit "${UNIT_PATH}"
 if command -v systemctl >/dev/null 2>&1; then
@@ -247,37 +346,10 @@ else
 fi
 
 if [ -n "${TOKEN}" ]; then
-  log "enrolling as ${SERVICE_USER} (HOOKDEPLOY_CERT_DIR=${CERT_DIR})"
-  set +e
-  if [ "${DRY_RUN}" -eq 1 ]; then
-    run sudo -u "${SERVICE_USER}" env HOOKDEPLOY_CERT_DIR="${CERT_DIR}" "${INSTALL_PATH}" enroll -token "${TOKEN}"
-    enroll_ec=0
-  else
-    sudo -u "${SERVICE_USER}" env HOOKDEPLOY_CERT_DIR="${CERT_DIR}" "${INSTALL_PATH}" enroll -token "${TOKEN}"
-    enroll_ec=$?
-  fi
-  set -e
-  if [ "${enroll_ec}" -ne 0 ]; then
-    if already_enrolled; then
-      log "enroll failed (exit ${enroll_ec}); existing credentials kept — same token is one-time and cannot be reused"
-    else
-      die "enroll failed (exit ${enroll_ec}) and no usable credentials in ${CERT_DIR}"
-    fi
-  fi
-  if command -v systemctl >/dev/null 2>&1; then
-    run systemctl enable --now hookdeployed
-    # Pick up creds if the unit was already running from a prior install.
-    run systemctl restart hookdeployed
-  fi
+  enroll_with_token "${INSTALL_PATH}" "${TOKEN}"
   log "installed ${INSTALL_PATH} and started hookdeployed.service"
   exit 0
 fi
 
 log "installed ${INSTALL_PATH} and ${UNIT_PATH}"
-log "no token given — service is not enabled (connect needs credentials)."
-log "In a real terminal, enroll then start:"
-cat <<EOF
-  sudo -u ${SERVICE_USER} env HOOKDEPLOY_CERT_DIR=${CERT_DIR} ${INSTALL_PATH} enroll
-  sudo systemctl enable --now hookdeployed
-EOF
-log "Do not pipe that enroll command: device-code needs a TTY. For unattended install, re-run with --token."
+print_no_token_instructions "${INSTALL_PATH}"

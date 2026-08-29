@@ -1,0 +1,13 @@
+Template: hookdeployed/enroll_token
+Type: password
+Default:
+Description: One-time HookDeploy enrollment token:
+ The hookdeployed service needs credentials before it can start.
+ Leave this empty to install only; enroll later in a real terminal:
+ .
+  sudo -u hookdeployed env HOOKDEPLOY_CERT_DIR=/var/lib/hookdeployed/certs \
+    /usr/bin/hookdeployed enroll
+  sudo systemctl enable --now hookdeployed
+ .
+ A token from the dashboard (hd_enroll_…) enrolls and starts the
+ service unattended. The token is one-time and is not stored.
