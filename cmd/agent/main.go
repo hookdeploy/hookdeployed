@@ -227,6 +227,7 @@ func runTapStart() error {
 		Root:      *dir,
 		EnrollURL: *enrollURL,
 		TTY:       tty,
+		Stdin:     os.Stdin,
 		Stdout:    os.Stdout,
 	}, opts)
 }

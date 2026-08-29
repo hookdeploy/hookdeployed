@@ -528,6 +528,110 @@ func TestNonTTYRefusesBeforeCreate(t *testing.T) {
 	}
 }
 
+func TestNoTTYStartsWithoutTTY(t *testing.T) {
+	root := seedActive(t, testToken)
+	fake := &tapServer{
+		create: map[string]any{"tap": Tap{
+			ID:         "tap-headless",
+			TargetPort: 3000,
+			TargetPath: "/hooks",
+			ExpiresAt:  "2026-08-24T18:00:00Z",
+		}},
+		stop: map[string]any{"tap": Tap{ID: "tap-headless"}},
+	}
+	srv := fake.start(t)
+	defer srv.Close()
+
+	opts := startIDs(3000, "/hooks")
+	opts.NoTTY = true
+	var out bytes.Buffer
+	err := Start(context.Background(), Config{
+		Root:      root,
+		EnrollURL: srv.URL,
+		TTY:       false,
+		Stdout:    &out,
+		Client:    enroll.NewClient(srv.URL),
+		Wait:      func(context.Context) error { return nil },
+	}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.bodies[CreatePath] == nil {
+		t.Fatal("must create when -no-tty is set")
+	}
+	printed := out.String()
+	wantCreate := FormatCreated(opts, Tap{TargetPort: 3000, TargetPath: "/hooks", ExpiresAt: "2026-08-24T18:00:00Z"})
+	if !strings.Contains(printed, wantCreate) {
+		t.Fatalf("create line must match interactive FormatCreated:\n%s\nwant:\n%s", printed, wantCreate)
+	}
+	if !strings.Contains(printed, ConnectHint) {
+		t.Fatalf("connect hint:\n%s", printed)
+	}
+	if !strings.Contains(printed, "Stopped tap tap-headless.") {
+		t.Fatalf("stop confirm must match interactive:\n%s", printed)
+	}
+	if strings.Contains(printed, StopHint) {
+		t.Fatalf("headless must not print the Ctrl+C hint:\n%s", printed)
+	}
+	if !strings.Contains(printed, HeadlessHint) {
+		t.Fatalf("headless hint:\n%s", printed)
+	}
+}
+
+func TestNoTTYStdinCloseStops(t *testing.T) {
+	root := seedActive(t, testToken)
+	fake := &tapServer{
+		create: map[string]any{"tap": Tap{
+			ID:         "tap-eof",
+			TargetPort: 9,
+			TargetPath: "/",
+			ExpiresAt:  "2026-08-24T18:00:00Z",
+		}},
+		stop: map[string]any{"tap": Tap{ID: "tap-eof"}},
+	}
+	srv := fake.start(t)
+	defer srv.Close()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	opts := startIDs(9, "/")
+	opts.NoTTY = true
+	var out bytes.Buffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Start(context.Background(), Config{
+			Root:      root,
+			EnrollURL: srv.URL,
+			TTY:       false,
+			Stdin:     r,
+			Stdout:    &out,
+			Client:    enroll.NewClient(srv.URL),
+		}, opts)
+	}()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stdin close did not unblock Start")
+	}
+	if fake.bodies[StopPath]["tap_id"] != "tap-eof" {
+		t.Fatalf("stop body=%v", fake.bodies[StopPath])
+	}
+	if !strings.Contains(out.String(), "Stopped tap tap-eof.") {
+		t.Fatalf("stop confirm:\n%s", out.String())
+	}
+}
+
 func TestEveryP1ErrorRendersItsMessage(t *testing.T) {
 	cases := []struct {
 		code    string
@@ -687,6 +791,28 @@ func TestParseStartFlagsOnePositional(t *testing.T) {
 	}
 	if opts.EndpointID != testEndpointID || opts.DestinationID != "" || opts.Port != 3000 || opts.Path != "/hooks/raw" {
 		t.Fatalf("%+v", opts)
+	}
+}
+
+func TestParseStartFlagsNoTTY(t *testing.T) {
+	fs := flag.NewFlagSet("tap", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	opts, err := ParseStartFlags(fs, []string{testEndpointID, "-port", "3000", "-path", "/x", "-no-tty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.NoTTY || opts.EndpointID != testEndpointID || opts.Port != 3000 || opts.Path != "/x" {
+		t.Fatalf("%+v", opts)
+	}
+
+	fs2 := flag.NewFlagSet("tap", flag.ContinueOnError)
+	fs2.SetOutput(io.Discard)
+	opts2, err := ParseStartFlags(fs2, []string{"-no-tty", testEndpointID, testDestID, "-port", "9", "-path", "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts2.NoTTY || opts2.EndpointID != testEndpointID || opts2.DestinationID != testDestID {
+		t.Fatalf("bool flag must not consume the next arg: %+v", opts2)
 	}
 }
 
