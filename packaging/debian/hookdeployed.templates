@@ -1,5 +1,5 @@
 Template: hookdeployed/enroll_token
-Type: password
+Type: string
 Default:
 Description: One-time HookDeploy enrollment token:
  The hookdeployed service needs credentials before it can start.

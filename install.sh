@@ -140,7 +140,11 @@ _enroll_as_service_user() {
 
 enroll_with_token() {
   local bin_path="$1"
-  local token="$2"
+  # Strip CR/LF. Debconf retrieval and Windows-copied preseeds can leave a
+  # trailing CR; the worker hashes the raw string, so that is "invalid token"
+  # even though the hd_enroll_<region>_ prefix still matches.
+  local token
+  token=$(printf '%s' "$2" | tr -d '\r\n')
   local enroll_ec
   log "enrolling as ${SERVICE_USER} (HOOKDEPLOY_CERT_DIR=${CERT_DIR})"
   set +e
@@ -156,7 +160,10 @@ enroll_with_token() {
     if already_enrolled; then
       log "enroll failed (exit ${enroll_ec}); existing credentials kept — same token is one-time and cannot be reused"
     else
-      die "enroll failed (exit ${enroll_ec}) and no usable credentials in ${CERT_DIR}"
+      # Do not die() — postinst sources this file and die() is exit 1, which
+      # would fail dpkg configure. install.sh has set -e and still exits 1.
+      log "enroll failed (exit ${enroll_ec}) and no usable credentials in ${CERT_DIR}" >&2
+      return 1
     fi
   fi
   if command -v systemctl >/dev/null 2>&1; then

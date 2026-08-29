@@ -28,22 +28,29 @@ if [ -z "${TOKEN}" ] && [ -f /usr/share/debconf/confmodule ]; then
   TOKEN="${RET:-}"
 fi
 
+UNATTENDED_HINT="For unattended install, preseed hookdeployed/enroll_token or set HOOKDEPLOYED_TOKEN."
+
 case "$1" in
   configure)
     if [ -n "${TOKEN}" ]; then
-      enroll_with_token /usr/bin/hookdeployed "${TOKEN}"
-      if [ -f /usr/share/debconf/confmodule ]; then
-        . /usr/share/debconf/confmodule
-        db_set hookdeployed/enroll_token "" || true
-        db_fset hookdeployed/enroll_token seen false || true
+      # Enroll failure must not fail the package. Binary, unit, and user
+      # are already on disk; a bad token or network error is not a dpkg error.
+      if enroll_with_token /usr/bin/hookdeployed "${TOKEN}"; then
+        if [ -f /usr/share/debconf/confmodule ]; then
+          . /usr/share/debconf/confmodule
+          db_set hookdeployed/enroll_token "" || true
+          db_fset hookdeployed/enroll_token seen false || true
+        fi
+      else
+        log "enrollment did not succeed — package is installed; enroll manually:"
+        print_no_token_instructions /usr/bin/hookdeployed "${UNATTENDED_HINT}"
       fi
     elif already_enrolled && command -v systemctl >/dev/null 2>&1 \
       && systemctl is-enabled hookdeployed.service >/dev/null 2>&1; then
       # Upgrade of an already-enrolled, enabled install: pick up the new binary.
       systemctl restart hookdeployed.service || true
     else
-      print_no_token_instructions /usr/bin/hookdeployed \
-        "For unattended install, preseed hookdeployed/enroll_token or set HOOKDEPLOYED_TOKEN."
+      print_no_token_instructions /usr/bin/hookdeployed "${UNATTENDED_HINT}"
     fi
     ;;
 esac
