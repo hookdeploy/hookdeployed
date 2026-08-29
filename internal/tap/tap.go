@@ -20,17 +20,23 @@ const (
 	ListPath    = "/v1/agents/taps/list"
 	StopPath    = "/v1/agents/taps/stop"
 
-	// NeedsTTY is the non-TTY refusal for the blocking create command.
-	// Same discipline as switch and enroll: a script must not hold a tap
-	// open with nobody watching.
+	// NeedsTTY is the non-TTY refusal for the blocking create command
+	// when -no-tty is not set. Same discipline as switch and enroll:
+	// a script must not hold a tap open with nobody watching.
 	NeedsTTY = "not a TTY; agent tap blocks until Ctrl+C. Run it in a terminal."
 
 	// ConnectHint is printed after a tap is created. The CLI cannot see
 	// whether connect is running; deliveries are silent without it.
 	ConnectHint = "Deliveries land only while `agent connect` is running on this machine."
 
+	// StopHint is the interactive wait line. HeadlessHint is the -no-tty
+	// equivalent. Create/stop confirmation strings are shared; only this
+	// instructional line differs.
+	StopHint     = "Ctrl+C stops the tap."
+	HeadlessHint = "Closing stdin stops the tap."
+
 	Usage = `usage: agent tap list
-       agent tap <endpoint-id> [<destination-id>] -port PORT -path PATH [-duration DUR]
+       agent tap <endpoint-id> [<destination-id>] -port PORT -path PATH [-duration DUR] [-no-tty]
        agent tap stop [id]`
 
 	ErrNotUUID = "doesn't look like a valid id"
@@ -68,8 +74,13 @@ type Config struct {
 	EnrollURL string
 	TTY       bool
 	Stdout    io.Writer
-	Client    *enroll.Client
-	// Wait holds the blocking tap open. Tests replace it. Nil waits on ctx.
+	// Stdin is watched for EOF when StartOpts.NoTTY is set and Wait is
+	// nil. A supervising parent stops the tap by closing its write end.
+	// Production passes os.Stdin. Tests pass a pipe.
+	Stdin  io.Reader
+	Client *enroll.Client
+	// Wait holds the blocking tap open. Tests replace it. Nil waits on
+	// ctx, and also on stdin EOF when NoTTY is set.
 	Wait func(ctx context.Context) error
 	// Stop overrides Client stop (tests). Nil uses the real call.
 	Stop func(token, tapID string) error
@@ -260,6 +271,10 @@ type StartOpts struct {
 	Port          int
 	Path          string
 	Duration      time.Duration
+	// NoTTY skips the interactive-TTY requirement. The tap stays up
+	// until stdin hits EOF or the wait context is cancelled (SIGINT /
+	// SIGTERM on platforms that deliver them).
+	NoTTY bool
 }
 
 func Start(ctx context.Context, cfg Config, opts StartOpts) error {
@@ -285,7 +300,7 @@ func Start(ctx context.Context, cfg Config, opts StartOpts) error {
 			return err
 		}
 	}
-	if !cfg.TTY {
+	if !opts.NoTTY && !cfg.TTY {
 		return fmt.Errorf("%s", NeedsTTY)
 	}
 
@@ -308,13 +323,16 @@ func Start(ctx context.Context, cfg Config, opts StartOpts) error {
 
 	fmt.Fprint(cfg.out(), FormatCreated(opts, created))
 	fmt.Fprintln(cfg.out(), ConnectHint)
-	fmt.Fprintln(cfg.out(), "Ctrl+C stops the tap.")
+	if opts.NoTTY {
+		fmt.Fprintln(cfg.out(), HeadlessHint)
+	} else {
+		fmt.Fprintln(cfg.out(), StopHint)
+	}
 
 	wait := cfg.Wait
 	if wait == nil {
 		wait = func(waitCtx context.Context) error {
-			<-waitCtx.Done()
-			return nil
+			return waitUntilStop(waitCtx, opts.NoTTY, cfg.Stdin)
 		}
 	}
 	_ = wait(ctx)
@@ -346,10 +364,28 @@ func failedStopError(created Tap, err error) error {
 	return fmt.Errorf("could not stop tap %s: %s\nThe tap is still live and will linger until it expires (%s) or this agent disconnects.", created.ID, msg, expires)
 }
 
+func waitUntilStop(ctx context.Context, watchStdin bool, stdin io.Reader) error {
+	if !watchStdin || stdin == nil {
+		<-ctx.Done()
+		return nil
+	}
+	eof := make(chan struct{})
+	go func() {
+		defer close(eof)
+		_, _ = io.Copy(io.Discard, stdin)
+	}()
+	select {
+	case <-ctx.Done():
+	case <-eof:
+	}
+	return nil
+}
+
 func ParseStartFlags(fs *flag.FlagSet, args []string) (StartOpts, error) {
 	port := fs.Int("port", 0, "local port that receives the tapped delivery")
 	path := fs.String("path", "", "local path (must start with /)")
 	duration := fs.Duration("duration", 0, "how long the tap stays live (server clamps at 8h)")
+	noTTY := fs.Bool("no-tty", false, "run without a TTY; stop when stdin closes")
 	positionals, err := assignFlagsAnywhere(fs, args)
 	if err != nil {
 		return StartOpts{}, err
@@ -358,6 +394,7 @@ func ParseStartFlags(fs *flag.FlagSet, args []string) (StartOpts, error) {
 		Port:     *port,
 		Path:     *path,
 		Duration: *duration,
+		NoTTY:    *noTTY,
 	}
 	if len(positionals) >= 1 {
 		opts.EndpointID = positionals[0]
@@ -392,6 +429,12 @@ func assignFlagsAnywhere(fs *flag.FlagSet, args []string) (positionals []string,
 		if fs.Lookup(name) == nil {
 			return nil, fmt.Errorf("flag provided but not defined: -%s", name)
 		}
+		if isBoolFlag(fs, name) {
+			if err := fs.Set(name, "true"); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if i+1 >= len(args) {
 			return nil, fmt.Errorf("flag needs an argument: -%s", name)
 		}
@@ -401,4 +444,13 @@ func assignFlagsAnywhere(fs *flag.FlagSet, args []string) (positionals []string,
 		}
 	}
 	return positionals, nil
+}
+
+func isBoolFlag(fs *flag.FlagSet, name string) bool {
+	f := fs.Lookup(name)
+	if f == nil {
+		return false
+	}
+	bf, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok && bf.IsBoolFlag()
 }
