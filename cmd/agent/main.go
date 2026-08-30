@@ -75,6 +75,7 @@ func runEnroll() error {
 	baseURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker base URL")
 	token := fs.String("token", "", "one-time enrollment token (scripted/CI)")
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory (0600 files)")
+	noTTY := fs.Bool("no-tty", false, "run without a TTY; read the browser code from stdin")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -84,7 +85,7 @@ func runEnroll() error {
 		}
 		return confirmStore(*dir)
 	}
-	if err := enroll.RunDevice(*baseURL, *dir); err != nil {
+	if err := enroll.RunDeviceOpts(*baseURL, *dir, *noTTY); err != nil {
 		return err
 	}
 	return confirmStore(*dir)

@@ -25,11 +25,21 @@ type deviceIO struct {
 }
 
 func RunDevice(baseURL, certDir string) error {
+	return RunDeviceOpts(baseURL, certDir, false)
+}
+
+// RunDeviceOpts is RunDevice with an explicit -no-tty switch. When noTTY
+// is true the TTY check is skipped so a supervising parent (tray) can
+// feed the browser code on stdin. The interactive path is unchanged.
+func RunDeviceOpts(baseURL, certDir string, noTTY bool) error {
 	return runDevice(baseURL, certDir, deviceIO{
 		In:      os.Stdin,
 		Out:     os.Stderr,
 		OpenURL: tryOpenURL,
 		CheckInteractive: func() error {
+			if noTTY {
+				return nil
+			}
 			return RequireInteractiveFile(os.Stdin)
 		},
 	})
