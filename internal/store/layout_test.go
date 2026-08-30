@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"os"
 	"path/filepath"
@@ -236,6 +238,113 @@ func TestFormatListMarksActive(t *testing.T) {
 	}
 	if !strings.Contains(text, "—") {
 		t.Fatalf("empty name/slug should be em dash:\n%s", text)
+	}
+}
+
+const formatListGolden = "  id-1  Acme  acme\n* id-2  —  —\n"
+
+func TestFormatListTextUnchanged(t *testing.T) {
+	got := FormatList([]Enrollment{
+		{ID: "id-1", Name: "Acme", Slug: "acme", Active: false, AgentID: "ignored-in-text"},
+		{ID: "id-2", Name: "", Slug: "", Active: true, AgentID: "also-ignored"},
+	})
+	if got != formatListGolden {
+		t.Fatalf("human-readable list changed:\n got %q\nwant %q", got, formatListGolden)
+	}
+}
+
+func TestPrintListDefaultMatchesFormatList(t *testing.T) {
+	orgs := []Enrollment{
+		{ID: "id-1", Name: "Acme", Slug: "acme", Active: false},
+		{ID: "id-2", Name: "", Slug: "", Active: true},
+	}
+	var buf bytes.Buffer
+	if err := PrintList(&buf, orgs, false); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != FormatList(orgs) || buf.String() != formatListGolden {
+		t.Fatalf("default output drifted:\n%s", buf.String())
+	}
+}
+
+func TestPrintListJSONRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	seedTwoOrgs(t, root)
+	orgs, err := List(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := PrintList(&buf, orgs, true); err != nil {
+		t.Fatal(err)
+	}
+	var parsed []struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Slug    string `json:"slug"`
+		Active  bool   `json:"active"`
+		AgentID string `json:"agent_id"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, buf.String())
+	}
+	if len(parsed) != 2 {
+		t.Fatalf("len=%d want 2: %s", len(parsed), buf.String())
+	}
+	byID := map[string]struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Slug    string `json:"slug"`
+		Active  bool   `json:"active"`
+		AgentID string `json:"agent_id"`
+	}{}
+	for _, row := range parsed {
+		byID[row.ID] = row
+	}
+	alpha, ok := byID["org-a"]
+	if !ok {
+		t.Fatalf("missing org-a: %s", buf.String())
+	}
+	if alpha.Name != "Alpha" || alpha.Slug != "alpha" || !alpha.Active {
+		t.Fatalf("org-a=%#v", alpha)
+	}
+	if alpha.AgentID != mtls.TestClientCN {
+		t.Fatalf("agent_id=%q want %q", alpha.AgentID, mtls.TestClientCN)
+	}
+	beta := byID["org-b"]
+	if beta.Name != "Beta" || beta.Active || beta.AgentID != mtls.TestClientCN {
+		t.Fatalf("org-b=%#v", beta)
+	}
+	if strings.Contains(buf.String(), `"dir"`) {
+		t.Fatalf("json must not leak Dir: %s", buf.String())
+	}
+}
+
+func TestPrintListJSONEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	if err := PrintList(&buf, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(buf.String()) != "[]" {
+		t.Fatalf("empty json=%q", buf.String())
+	}
+	var parsed []Enrollment
+	if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if parsed == nil || len(parsed) != 0 {
+		t.Fatalf("parsed=%#v", parsed)
+	}
+}
+
+func TestPrintListEmptyTextStillErrors(t *testing.T) {
+	var buf bytes.Buffer
+	err := PrintList(&buf, nil, false)
+	if err == nil || err.Error() != "no enrolled organizations — run `agent enroll`" {
+		t.Fatalf("err=%v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("stdout should stay empty, got %q", buf.String())
 	}
 }
 

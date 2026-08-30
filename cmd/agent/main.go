@@ -125,6 +125,7 @@ func runConnect() error {
 func runList() error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	asJSON := fs.Bool("json", false, "print enrolled organizations as JSON")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -132,11 +133,7 @@ func runList() error {
 	if err != nil {
 		return err
 	}
-	if len(orgs) == 0 {
-		return fmt.Errorf("no enrolled organizations — run `agent enroll`")
-	}
-	fmt.Print(store.FormatList(orgs))
-	return nil
+	return store.PrintList(os.Stdout, orgs, *asJSON)
 }
 
 func runUnenroll() error {
@@ -185,6 +182,7 @@ func runTapList() error {
 	fs := flag.NewFlagSet("tap list", flag.ExitOnError)
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
 	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker")
+	asJSON := fs.Bool("json", false, "print endpoints, destinations, and taps as JSON")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -192,6 +190,7 @@ func runTapList() error {
 		Root:      *dir,
 		EnrollURL: *enrollURL,
 		Stdout:    os.Stdout,
+		JSON:      *asJSON,
 	})
 }
 

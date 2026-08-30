@@ -1,6 +1,7 @@
 package tap
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -39,6 +40,27 @@ func FormatList(endpoints []Endpoint, taps []Tap) string {
 		fmt.Fprintf(&b, "  %s / %s  %s  %s\n", name, dest, formatTarget(t), formatExpires(t.ExpiresAt))
 	}
 	return b.String()
+}
+
+// FormatJSON is the -json body for `tap list`. Nil slices become [].
+func FormatJSON(endpoints []Endpoint, taps []Tap) ([]byte, error) {
+	if endpoints == nil {
+		endpoints = []Endpoint{}
+	}
+	if taps == nil {
+		taps = []Tap{}
+	}
+	normalized := make([]Endpoint, len(endpoints))
+	copy(normalized, endpoints)
+	for i := range normalized {
+		if normalized[i].Destinations == nil {
+			normalized[i].Destinations = []Destination{}
+		}
+	}
+	return json.Marshal(struct {
+		Endpoints []Endpoint `json:"endpoints"`
+		Taps      []Tap      `json:"taps"`
+	}{Endpoints: normalized, Taps: taps})
 }
 
 func resolveTapNames(endpoints []Endpoint, t Tap) (slug, dest string) {
