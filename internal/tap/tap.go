@@ -46,13 +46,16 @@ type Endpoint struct {
 	ID           string        `json:"id"`
 	Slug         string        `json:"slug"`
 	Name         string        `json:"name"`
+	URL          string        `json:"url"`
 	Destinations []Destination `json:"destinations"`
 }
 
 type Destination struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	DestinationType string `json:"destination_type"`
+	ID              string  `json:"id"`
+	Name            string  `json:"name"`
+	DestinationType string  `json:"destination_type"`
+	AgentID         *string `json:"agent_id"`
+	URL             *string `json:"url"`
 }
 
 type Tap struct {
@@ -73,7 +76,9 @@ type Config struct {
 	Root      string
 	EnrollURL string
 	TTY       bool
-	Stdout    io.Writer
+	// JSON selects -json output for List. Default text is unchanged.
+	JSON   bool
+	Stdout io.Writer
 	// Stdin is watched for EOF when StartOpts.NoTTY is set and Wait is
 	// nil. A supervising parent stops the tap by closing its write end.
 	// Production passes os.Stdin. Tests pass a pipe.
@@ -227,6 +232,14 @@ func List(cfg Config) error {
 	taps, err := fetchTaps(client, tok.Token)
 	if err != nil {
 		return err
+	}
+	if cfg.JSON {
+		raw, err := FormatJSON(endpoints, taps)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(cfg.out(), string(raw))
+		return nil
 	}
 	fmt.Fprint(cfg.out(), FormatList(endpoints, taps))
 	return nil
