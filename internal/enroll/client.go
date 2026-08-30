@@ -202,6 +202,23 @@ func (c *Client) SelfRevoke(renewalToken string) error {
 	}, &out)
 }
 
+type RenameResult struct {
+	OK      bool    `json:"ok"`
+	AgentID string  `json:"agent_id"`
+	Name    *string `json:"name"`
+}
+
+func (c *Client) Rename(renewalToken, name string) (*RenameResult, error) {
+	var out RenameResult
+	if err := c.post("/v1/agents/rename", map[string]string{
+		"renewal_token": renewalToken,
+		"name":          name,
+	}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) RenewWithToken(renewalToken string, csrPEM []byte) (*TokenResponse, error) {
 	var out TokenResponse
 	if err := c.post("/v1/enroll/renew", map[string]string{

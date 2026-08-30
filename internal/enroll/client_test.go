@@ -263,3 +263,30 @@ func TestAPIErrorParsesAmbiguousDestinations(t *testing.T) {
 		t.Fatalf("destinations=%+v", api.Destinations)
 	}
 }
+
+func TestRenamePostsTokenAndName(t *testing.T) {
+	var path string
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"agent_id":"agent-1","name":"Laptop"}`))
+	}))
+	defer srv.Close()
+
+	out, err := NewClient(srv.URL).Rename("hd_agentrenew_us_tok", "Laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/v1/agents/rename" {
+		t.Fatalf("path=%s", path)
+	}
+	if got["renewal_token"] != "hd_agentrenew_us_tok" || got["name"] != "Laptop" {
+		t.Fatalf("body=%#v", got)
+	}
+	if out == nil || out.AgentID != "agent-1" || out.Name == nil || *out.Name != "Laptop" {
+		t.Fatalf("out=%+v", out)
+	}
+}
