@@ -385,6 +385,9 @@ func TestRunDevicePrintsURLStoresOrgNameAndSucceeds(t *testing.T) {
 	if _, ok := startBody["org_hint"]; ok {
 		t.Fatalf("start sent org_hint: %#v", startBody)
 	}
+	if _, ok := startBody["client"]; ok {
+		t.Fatalf("plain enroll must omit client: %#v", startBody)
+	}
 	if pollBody["user_code"] != "ABCD2345" {
 		t.Fatalf("poll body=%#v", pollBody)
 	}
@@ -411,5 +414,55 @@ func TestRunDevicePrintsURLStoresOrgNameAndSucceeds(t *testing.T) {
 	active, err := store.ReadActive(dir)
 	if err != nil || active != "org-1" {
 		t.Fatalf("active=%q err=%v", active, err)
+	}
+}
+
+func TestRunDeviceSendsClientIdentifier(t *testing.T) {
+	chain, err := GenerateStepLikeChain("agent-1", "org-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startBody map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/v1/enroll/device/start":
+			_ = json.Unmarshal(raw, &startBody)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"session_id":       "s1",
+				"device_code":      "dev",
+				"verification_url": "https://app.hookdeploy.dev/app/cli-auth/s1",
+				"interval":         1,
+				"expires_in":       60,
+			})
+		case "/v1/enroll/device/poll":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":        "approved",
+				"certificate":   string(chain.LeafPEM),
+				"ca":            string(chain.IntermediatePEM),
+				"certChain":     string(chain.CertChainPEM),
+				"root":          string(chain.RootPEM),
+				"agent_id":      "agent-1",
+				"org_id":        "org-1",
+				"org_name":      "Acme Corp",
+				"org_slug":      "acme",
+				"renewal_token": "hd_agentrenew_us_x",
+			})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	if err := runDevice(srv.URL, t.TempDir(), deviceIO{
+		In:      strings.NewReader("ABCD2345\n"),
+		Out:     io.Discard,
+		OpenURL: func(string) {},
+		Client:  "agent-gui",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if startBody["client"] != "agent-gui" {
+		t.Fatalf("start body=%#v", startBody)
 	}
 }

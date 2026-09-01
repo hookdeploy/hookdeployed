@@ -90,10 +90,13 @@ type TokenResponse struct {
 	Minted
 }
 
-func (c *Client) DeviceStart(hostname string) (*StartResponse, error) {
+func (c *Client) DeviceStart(hostname, client string) (*StartResponse, error) {
 	body := map[string]string{}
 	if hostname != "" {
 		body["hostname"] = hostname
+	}
+	if trimmed := strings.TrimSpace(client); trimmed != "" {
+		body["client"] = trimmed
 	}
 	var out StartResponse
 	if err := c.post("/v1/enroll/device/start", body, &out); err != nil {

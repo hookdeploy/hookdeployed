@@ -84,6 +84,7 @@ func runEnroll() error {
 	token := fs.String("token", "", "one-time enrollment token (scripted/CI)")
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory (0600 files)")
 	noTTY := fs.Bool("no-tty", false, "run without a TTY; read the browser code from stdin")
+	client := fs.String("client", "", "enrollment client identifier (agent-gui for the desktop app)")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -93,7 +94,7 @@ func runEnroll() error {
 		}
 		return confirmStore(*dir)
 	}
-	if err := enroll.RunDeviceOpts(*baseURL, *dir, *noTTY); err != nil {
+	if err := enroll.RunDeviceOpts(*baseURL, *dir, *noTTY, *client); err != nil {
 		return err
 	}
 	return confirmStore(*dir)
