@@ -108,13 +108,33 @@ func TestClientDeviceStartSendsHostname(t *testing.T) {
 		_, _ = w.Write([]byte(`{"session_id":"s1","device_code":"dev","verification_url":"https://app.example/app/cli-auth/s1","interval":5,"expires_in":600}`))
 	}))
 	defer srv.Close()
-	if _, err := NewClient(srv.URL).DeviceStart("michaels-macbook"); err != nil {
+	if _, err := NewClient(srv.URL).DeviceStart("michaels-macbook", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := got["org_hint"]; ok {
 		t.Fatalf("org_hint must be omitted, body=%#v", got)
 	}
 	if got["hostname"] != "michaels-macbook" {
+		t.Fatalf("body=%#v", got)
+	}
+	if _, ok := got["client"]; ok {
+		t.Fatalf("client must be omitted when empty, body=%#v", got)
+	}
+}
+
+func TestClientDeviceStartSendsClientWhenSet(t *testing.T) {
+	var got map[string]string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"session_id":"s1","device_code":"dev","verification_url":"https://app.example/app/cli-auth/s1","interval":5,"expires_in":600}`))
+	}))
+	defer srv.Close()
+	if _, err := NewClient(srv.URL).DeviceStart("box", "agent-gui"); err != nil {
+		t.Fatal(err)
+	}
+	if got["client"] != "agent-gui" {
 		t.Fatalf("body=%#v", got)
 	}
 }

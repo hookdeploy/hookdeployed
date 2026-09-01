@@ -22,20 +22,23 @@ type deviceIO struct {
 	Out              io.Writer
 	OpenURL          func(string)
 	CheckInteractive func() error
+	Client           string
 }
 
 func RunDevice(baseURL, certDir string) error {
-	return RunDeviceOpts(baseURL, certDir, false)
+	return RunDeviceOpts(baseURL, certDir, false, "")
 }
 
 // RunDeviceOpts is RunDevice with an explicit -no-tty switch. When noTTY
 // is true the TTY check is skipped so a supervising parent (tray) can
 // feed the browser code on stdin. The interactive path is unchanged.
-func RunDeviceOpts(baseURL, certDir string, noTTY bool) error {
+// client is an optional identifier (e.g. "agent-gui") sent on device/start.
+func RunDeviceOpts(baseURL, certDir string, noTTY bool, client string) error {
 	return runDevice(baseURL, certDir, deviceIO{
 		In:      os.Stdin,
 		Out:     os.Stderr,
 		OpenURL: tryOpenURL,
+		Client:  client,
 		CheckInteractive: func() error {
 			if noTTY {
 				return nil
@@ -56,7 +59,7 @@ func runDevice(baseURL, certDir string, io deviceIO) error {
 		return err
 	}
 	client := NewClient(baseURL)
-	start, err := client.DeviceStart(localHostname())
+	start, err := client.DeviceStart(localHostname(), io.Client)
 	if err != nil {
 		return err
 	}
