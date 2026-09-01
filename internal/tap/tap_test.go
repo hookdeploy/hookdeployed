@@ -136,22 +136,86 @@ func writeAPIError(w http.ResponseWriter, api *enroll.APIError) {
 }
 
 func sampleEndpoints() []Endpoint {
+	agentID := "agent-bound-001"
+	httpsURL := "https://hooks.example.com/stripe"
 	return []Endpoint{
 		{
 			ID:   "ep-orders",
 			Slug: "orders",
 			Name: "Orders",
+			URL:  "https://hookdeploy.dev/a/orders",
 			Destinations: []Destination{
-				{ID: "dest-https", Name: "prod-https", DestinationType: "https"},
-				{ID: "dest-agent", Name: "prod-agent", DestinationType: "agent"},
+				{ID: "dest-https", Name: "prod-https", DestinationType: "https", URL: &httpsURL},
+				{ID: "dest-agent", Name: "prod-agent", DestinationType: "agent", AgentID: &agentID},
 			},
 		},
 		{
 			ID:           "ep-billing",
 			Slug:         "billing",
 			Name:         "Billing",
+			URL:          "https://hookdeploy.dev/a/billing",
 			Destinations: nil,
 		},
+	}
+}
+
+const formatListGolden = `Orders
+  ep-orders
+  prod-https (https)
+    dest-https
+  prod-agent (agent)
+    dest-agent
+
+Billing
+  ep-billing
+  (no destinations)
+
+RUNNING TAPS
+  (none)
+`
+
+const formatListEmptyGolden = `No endpoints in this organization.
+
+RUNNING TAPS
+  (none)
+`
+
+const formatListWithTapGolden = `Orders
+  ep-orders
+  prod-https (https)
+    dest-https
+  prod-agent (agent)
+    dest-agent
+
+Billing
+  ep-billing
+  (no destinations)
+
+RUNNING TAPS
+tap-live
+  Orders / prod-https  127.0.0.1:3000/hooks/stripe  2026-08-24 18:00 UTC
+`
+
+func sampleLiveTap() Tap {
+	return Tap{
+		ID:            "tap-live",
+		EndpointID:    "ep-orders",
+		DestinationID: strPtr("dest-https"),
+		TargetPort:    3000,
+		TargetPath:    "/hooks/stripe",
+		ExpiresAt:     "2026-08-24T18:00:00.000Z",
+	}
+}
+
+func TestFormatListTextUnchanged(t *testing.T) {
+	if got := FormatList(sampleEndpoints(), nil); got != formatListGolden {
+		t.Fatalf("human-readable tap list changed:\n got %q\nwant %q", got, formatListGolden)
+	}
+	if got := FormatList(nil, nil); got != formatListEmptyGolden {
+		t.Fatalf("empty tap list changed:\n got %q\nwant %q", got, formatListEmptyGolden)
+	}
+	if got := FormatList(sampleEndpoints(), []Tap{sampleLiveTap()}); got != formatListWithTapGolden {
+		t.Fatalf("running-tap list changed:\n got %q\nwant %q", got, formatListWithTapGolden)
 	}
 }
 
@@ -191,14 +255,7 @@ func TestListCallsBothRoutesAndRenders(t *testing.T) {
 	root := seedActive(t, testToken)
 	srv := (&tapServer{
 		targets: map[string]any{"endpoints": sampleEndpoints()},
-		taps: map[string]any{"taps": []Tap{{
-			ID:            "tap-live",
-			EndpointID:    "ep-orders",
-			DestinationID: strPtr("dest-https"),
-			TargetPort:    3000,
-			TargetPath:    "/hooks/stripe",
-			ExpiresAt:     "2026-08-24T18:00:00.000Z",
-		}}},
+		taps:    map[string]any{"taps": []Tap{sampleLiveTap()}},
 	}).start(t)
 	defer srv.Close()
 
@@ -212,6 +269,9 @@ func TestListCallsBothRoutesAndRenders(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
+	if got != formatListWithTapGolden {
+		t.Fatalf("default tap list is not byte-identical:\n got %q\nwant %q", got, formatListWithTapGolden)
+	}
 	if !strings.Contains(got, "orders") || !strings.Contains(got, "tap-live") {
 		t.Fatalf("list output:\n%s", got)
 	}
@@ -223,6 +283,111 @@ func TestListCallsBothRoutesAndRenders(t *testing.T) {
 	}
 	if !strings.Contains(got, "prod-https") {
 		t.Fatalf("running tap should join dest name:\n%s", got)
+	}
+}
+
+func TestListJSONRoundTrip(t *testing.T) {
+	root := seedActive(t, testToken)
+	live := sampleLiveTap()
+	live.OrganizationID = "org-1"
+	live.AgentID = "agent-tap-target"
+	live.CreatedByAgentID = "agent-creator"
+	live.CreatedAt = "2026-08-24T10:00:00.000Z"
+	srv := (&tapServer{
+		targets: map[string]any{"endpoints": sampleEndpoints()},
+		taps:    map[string]any{"taps": []Tap{live}},
+	}).start(t)
+	defer srv.Close()
+
+	var out bytes.Buffer
+	if err := List(Config{
+		Root:      root,
+		EnrollURL: srv.URL,
+		Stdout:    &out,
+		Client:    enroll.NewClient(srv.URL),
+		JSON:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Endpoints []Endpoint `json:"endpoints"`
+		Taps      []Tap      `json:"taps"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, out.String())
+	}
+	if len(parsed.Endpoints) != 2 || len(parsed.Taps) != 1 {
+		t.Fatalf("shape=%s", out.String())
+	}
+	orders := parsed.Endpoints[0]
+	if orders.ID != "ep-orders" || orders.URL != "https://hookdeploy.dev/a/orders" {
+		t.Fatalf("endpoint url=%#v", orders)
+	}
+	if len(orders.Destinations) != 2 {
+		t.Fatalf("dests=%#v", orders.Destinations)
+	}
+	https := orders.Destinations[0]
+	if https.AgentID != nil {
+		t.Fatalf("https dest agent_id should be null, got %v", *https.AgentID)
+	}
+	if https.URL == nil || *https.URL != "https://hooks.example.com/stripe" {
+		t.Fatalf("https dest url=%v", https.URL)
+	}
+	agent := orders.Destinations[1]
+	if agent.AgentID == nil || *agent.AgentID != "agent-bound-001" {
+		t.Fatalf("agent dest agent_id=%v", agent.AgentID)
+	}
+	if agent.URL != nil {
+		t.Fatalf("agent dest url should be null, got %v", *agent.URL)
+	}
+	if parsed.Endpoints[1].Destinations == nil {
+		t.Fatal("empty dests must be [] not null")
+	}
+	if parsed.Taps[0].ID != "tap-live" || parsed.Taps[0].AgentID != "agent-tap-target" {
+		t.Fatalf("tap=%#v", parsed.Taps[0])
+	}
+}
+
+func TestListJSONEmpty(t *testing.T) {
+	root := seedActive(t, testToken)
+	srv := (&tapServer{
+		targets: map[string]any{"endpoints": []Endpoint{}},
+		taps:    map[string]any{"taps": []Tap{}},
+	}).start(t)
+	defer srv.Close()
+
+	var out bytes.Buffer
+	if err := List(Config{
+		Root:      root,
+		EnrollURL: srv.URL,
+		Stdout:    &out,
+		Client:    enroll.NewClient(srv.URL),
+		JSON:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Endpoints []Endpoint `json:"endpoints"`
+		Taps      []Tap      `json:"taps"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatalf("invalid json: %v\n%s", err, out.String())
+	}
+	if parsed.Endpoints == nil || parsed.Taps == nil {
+		t.Fatalf("nil slices: %s", out.String())
+	}
+	if len(parsed.Endpoints) != 0 || len(parsed.Taps) != 0 {
+		t.Fatalf("want empty arrays: %s", out.String())
+	}
+	if strings.TrimSpace(out.String()) != `{"endpoints":[],"taps":[]}` {
+		t.Fatalf("empty json=%q", out.String())
+	}
+}
+
+func TestListJSONNotEnrolledStillErrors(t *testing.T) {
+	err := List(Config{Root: t.TempDir(), Stdout: io.Discard, JSON: true})
+	if err == nil || !strings.Contains(err.Error(), "run `agent enroll` first") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

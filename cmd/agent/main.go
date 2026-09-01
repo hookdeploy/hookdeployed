@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -56,6 +57,13 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "unenroll" {
 		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
 		if err := runUnenroll(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "rename" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+		if err := runRename(); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -126,6 +134,7 @@ func runConnect() error {
 func runList() error {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	asJSON := fs.Bool("json", false, "print enrolled organizations as JSON")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -133,10 +142,46 @@ func runList() error {
 	if err != nil {
 		return err
 	}
-	if len(orgs) == 0 {
-		return fmt.Errorf("no enrolled organizations — run `agent enroll`")
+	return store.PrintList(os.Stdout, orgs, *asJSON)
+}
+
+func runRename() error {
+	fs := flag.NewFlagSet("rename", flag.ExitOnError)
+	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
+	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker")
+	name := fs.String("name", "", "display name; empty clears to the hostname fallback")
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
 	}
-	fmt.Print(store.FormatList(orgs))
+	display := *name
+	if display == "" && len(fs.Args()) > 0 {
+		display = strings.Join(fs.Args(), " ")
+	}
+	orgDir, err := store.ResolveActiveDir(*dir)
+	if err != nil {
+		return store.ExplainResolve(*dir, err)
+	}
+	material, err := store.Load(orgDir)
+	if err != nil {
+		return err
+	}
+	token := strings.TrimSpace(material.RenewalToken)
+	if token == "" {
+		return fmt.Errorf("no renewal token — run `agent enroll`")
+	}
+	out, err := enroll.NewClient(*enrollURL).Rename(token, display)
+	if err != nil {
+		var api *enroll.APIError
+		if errors.As(err, &api) && api.Message != "" {
+			return fmt.Errorf("%s", api.Message)
+		}
+		return err
+	}
+	if out != nil && out.Name != nil && *out.Name != "" {
+		fmt.Fprintf(os.Stdout, "Renamed to %s.\n", *out.Name)
+	} else {
+		fmt.Fprintln(os.Stdout, "Display name cleared.")
+	}
 	return nil
 }
 
@@ -186,6 +231,7 @@ func runTapList() error {
 	fs := flag.NewFlagSet("tap list", flag.ExitOnError)
 	dir := fs.String("certs", store.DefaultDir(), "cert store directory")
 	enrollURL := fs.String("enroll-url", "https://enroll.hookdeploy.dev", "enrollment worker")
+	asJSON := fs.Bool("json", false, "print endpoints, destinations, and taps as JSON")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -193,6 +239,7 @@ func runTapList() error {
 		Root:      *dir,
 		EnrollURL: *enrollURL,
 		Stdout:    os.Stdout,
+		JSON:      *asJSON,
 	})
 }
 

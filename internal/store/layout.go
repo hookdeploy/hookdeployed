@@ -2,9 +2,11 @@ package store
 
 import (
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,11 +28,12 @@ var ErrNoActive = errors.New("no organization selected")
 
 // Enrollment is one per-org directory under the store root.
 type Enrollment struct {
-	ID     string
-	Name   string
-	Slug   string
-	Dir    string
-	Active bool
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Slug    string `json:"slug"`
+	AgentID string `json:"agent_id"`
+	Dir     string `json:"-"`
+	Active  bool   `json:"active"`
 }
 
 func OrgDir(root, orgID string) string {
@@ -328,7 +331,8 @@ func List(root string) ([]Enrollment, error) {
 			continue
 		}
 		dir := OrgDir(root, e.Name())
-		if _, err := Load(dir); err != nil {
+		material, err := Load(dir)
+		if err != nil {
 			continue
 		}
 		meta, _ := LoadOrgMeta(dir)
@@ -336,12 +340,17 @@ func List(root string) ([]Enrollment, error) {
 		if meta.ID != "" {
 			id = meta.ID
 		}
+		agentID := ""
+		if material.ClientCert != nil {
+			agentID = material.ClientCert.Subject.CommonName
+		}
 		out = append(out, Enrollment{
-			ID:     id,
-			Name:   meta.Name,
-			Slug:   meta.Slug,
-			Dir:    dir,
-			Active: active == e.Name() || active == id,
+			ID:      id,
+			Name:    meta.Name,
+			Slug:    meta.Slug,
+			AgentID: agentID,
+			Dir:     dir,
+			Active:  active == e.Name() || active == id,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -407,6 +416,33 @@ func FormatList(orgs []Enrollment) string {
 		fmt.Fprintf(&b, "%s %s  %s  %s\n", mark, o.ID, name, slug)
 	}
 	return b.String()
+}
+
+// FormatJSON is the -json body for `list`. Empty input is [] not null.
+func FormatJSON(orgs []Enrollment) ([]byte, error) {
+	if orgs == nil {
+		orgs = []Enrollment{}
+	}
+	return json.Marshal(orgs)
+}
+
+// PrintList writes FormatList, or FormatJSON when asJSON is set.
+// Zero orgs with asJSON writes [] and succeeds; without asJSON it
+// returns the existing enroll error (stdout stays empty).
+func PrintList(out io.Writer, orgs []Enrollment, asJSON bool) error {
+	if asJSON {
+		raw, err := FormatJSON(orgs)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(out, string(raw))
+		return err
+	}
+	if len(orgs) == 0 {
+		return fmt.Errorf("no enrolled organizations — run `agent enroll`")
+	}
+	_, err := fmt.Fprint(out, FormatList(orgs))
+	return err
 }
 
 func Match(orgs []Enrollment, query string) (Enrollment, error) {
