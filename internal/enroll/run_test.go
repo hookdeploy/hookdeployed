@@ -3,6 +3,7 @@ package enroll
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -262,6 +263,70 @@ func TestRequireInteractiveFilePipeFails(t *testing.T) {
 	err = RequireInteractiveFile(r)
 	if err == nil || !strings.Contains(err.Error(), "not a TTY") {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRunDeviceNoTTYSkipsInteractiveCheck(t *testing.T) {
+	chain, err := GenerateStepLikeChain("agent-1", "org-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/enroll/device/start":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"session_id":       "s1",
+				"device_code":      "dev",
+				"verification_url": "https://app.hookdeploy.dev/app/cli-auth/s1",
+				"interval":         1,
+				"expires_in":       60,
+			})
+		case "/v1/enroll/device/poll":
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":        "approved",
+				"certificate":   string(chain.LeafPEM),
+				"ca":            string(chain.IntermediatePEM),
+				"certChain":     string(chain.CertChainPEM),
+				"root":          string(chain.RootPEM),
+				"agent_id":      "agent-1",
+				"org_id":        "org-1",
+				"org_name":      "Acme Corp",
+				"org_slug":      "acme",
+				"renewal_token": "hd_agentrenew_us_x",
+			})
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	var out bytes.Buffer
+	ttyErr := fmt.Errorf("enroll needs a terminal to enter the code (stdin is not a TTY). Use -token for scripted enrollment")
+	if err := runDevice(srv.URL, dir, deviceIO{
+		In:               strings.NewReader("ABCD-2345\n"),
+		Out:              &out,
+		OpenURL:          func(string) {},
+		CheckInteractive: func() error { return ttyErr },
+	}); err == nil || !strings.Contains(err.Error(), "not a TTY") {
+		t.Fatalf("without -no-tty must honor the TTY check, err=%v", err)
+	}
+
+	// -no-tty is CheckInteractive: nil (RunDeviceOpts skips RequireInteractiveFile).
+	if err := runDevice(srv.URL, dir, deviceIO{
+		In:               strings.NewReader("ABCD-2345\n"),
+		Out:              &out,
+		OpenURL:          func(string) {},
+		CheckInteractive: nil,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Open this URL to enroll") {
+		t.Fatalf("no-tty path must still print the URL: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "enrolled in Acme Corp") {
+		t.Fatalf("no-tty path must enroll: %q", out.String())
 	}
 }
 
