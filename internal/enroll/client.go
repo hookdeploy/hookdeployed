@@ -249,6 +249,7 @@ func (c *Client) post(path string, body any, dest any) error {
 		return err
 	}
 	defer resp.Body.Close()
+	NoteResponseDate(resp.Header, time.Now())
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err

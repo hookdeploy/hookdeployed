@@ -51,6 +51,17 @@ const RevokedUserMessage = "this agent was revoked and can no longer connect. Lo
 // RevokedOrgMessage is logged when the revoked org was one of several.
 const RevokedOrgMessage = "this organization's credentials were removed. Other organizations are still enrolled. Run `agent switch` to pick one, or `agent enroll` to re-enroll this org."
 
+// DeadCredentialUserMessage is logged when renew/placement auth is permanently
+// dead (expired/revoked/reused token). Same tray phase as revoke (re-enroll).
+const DeadCredentialUserMessage = "this agent's credentials are no longer valid and can no longer connect. Local credentials were removed. Run `agent enroll`, then `agent connect`."
+
+// DeadCredentialOrgMessage is the multi-org variant of DeadCredentialUserMessage.
+const DeadCredentialOrgMessage = "this organization's credentials are no longer valid and were removed. Other organizations are still enrolled. Run `agent switch` to pick one, or `agent enroll` to re-enroll this org."
+
+// ClockSkewUserMessage is logged when TLS/cert failure coincides with excessive
+// skew vs the enrollment worker Date header. Credentials are kept.
+const ClockSkewUserMessage = "your system clock appears to be off by more than 5 minutes relative to Hookdeploy. Check your date and time settings, then run `agent connect` again."
+
 // DrainingUserMessage is logged when the relay is taking this box out of
 // rotation. Credentials stay; the next loop iteration re-places.
 const DrainingUserMessage = "this relay is draining. Moving you to another relay. Credentials were kept."
@@ -67,6 +78,15 @@ func (e Rejection) Error() string {
 		return "rejected"
 	}
 	return "rejected: " + e.Reason
+}
+
+// clockSkewError stops connect.Run without deleting credentials.
+type clockSkewError struct {
+	Skew time.Duration
+}
+
+func (e *clockSkewError) Error() string {
+	return ClockSkewUserMessage
 }
 
 type Config struct {
@@ -318,27 +338,48 @@ func IsWakeEvent(last, now time.Time, sampleInterval time.Duration) bool {
 	return gap > 2*sampleInterval
 }
 
-func attemptRenew(cfg Config) {
+func attemptRenew(cfg Config) error {
 	fn := cfg.Renew
 	if fn == nil {
 		fn = enroll.MaybeRenew
 	}
+	activeDir, activeErr := store.ResolveActiveDir(cfg.CertsDir)
 	dirs, err := store.ListOrgDirs(cfg.CertsDir)
 	if err != nil {
 		log.Printf("renew skipped/failed: %v", err)
-		return
+		return nil
 	}
 	if len(dirs) == 0 {
 		if err := fn(cfg.EnrollURL, cfg.CertsDir); err != nil {
 			log.Printf("renew skipped/failed: %v", err)
+			if enroll.IsDeadCredential(err) {
+				return err
+			}
+			if enroll.IsCertValidityMessage(err) && enroll.ExcessiveClockSkew() {
+				return &clockSkewError{}
+			}
 		}
-		return
+		return nil
 	}
 	for _, dir := range dirs {
 		if err := fn(cfg.EnrollURL, dir); err != nil {
 			log.Printf("renew skipped/failed org=%s: %v", filepath.Base(dir), err)
+			isActive := activeErr == nil && sameOrgDir(dir, activeDir)
+			if isActive && enroll.IsDeadCredential(err) {
+				return err
+			}
+			if isActive && enroll.IsCertValidityMessage(err) && enroll.ExcessiveClockSkew() {
+				return &clockSkewError{}
+			}
 		}
 	}
+	return nil
+}
+
+func sameOrgDir(a, b string) bool {
+	a = filepath.Clean(a)
+	b = filepath.Clean(b)
+	return a == b
 }
 
 func attemptReport(cfg Config) {
@@ -379,11 +420,24 @@ func Run(ctx context.Context, cfg Config) error {
 		// token. Do not add a rotation grace window.
 		// Placement runs after renew so the token we send is the one on disk.
 		attemptReport(cfg)
-		attemptRenew(cfg)
+		if err := attemptRenew(cfg); err != nil {
+			var skew *clockSkewError
+			if errors.As(err, &skew) {
+				return settleClockSkew(ctx, skew)
+			}
+			return settleDeadCredential(ctx, cfg)
+		}
 		host, addr, err := resolveDial(cfg)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			var skew *clockSkewError
+			if errors.As(err, &skew) {
+				return settleClockSkew(ctx, skew)
+			}
+			if enroll.IsDeadCredential(err) {
+				return settleDeadCredential(ctx, cfg)
 			}
 			usedFree = false
 			backoff = NextBackoff(backoff)
@@ -398,6 +452,10 @@ func Run(ctx context.Context, cfg Config) error {
 		if err := dialAndHeartbeat(ctx, cfg, host, addr); err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			var skew *clockSkewError
+			if errors.As(err, &skew) {
+				return settleClockSkew(ctx, skew)
 			}
 			var rej Rejection
 			if errors.As(err, &rej) {
@@ -466,6 +524,11 @@ func dialAndHeartbeat(ctx context.Context, cfg Config, host, addr string) error 
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if enroll.IsCertValidityMessage(err) && enroll.ExcessiveClockSkew() {
+			skew, _ := enroll.ObservedClockSkew()
+			log.Print(ClockSkewUserMessage)
+			return &clockSkewError{Skew: skew}
+		}
 		log.Printf("dial relay=%s: %v", host, err)
 		return err
 	}
@@ -521,32 +584,8 @@ func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {
 		return nil
 	}
 	if rej.Reason == "revoked" {
-		orgID, _ := store.ReadActive(cfg.CertsDir)
-		if orgID == "" {
-			if dir, err := store.ResolveActiveDir(cfg.CertsDir); err == nil {
-				orgID = filepath.Base(dir)
-			}
-		}
-		others := 0
-		if orgs, err := store.List(cfg.CertsDir); err == nil {
-			for _, o := range orgs {
-				if filepath.Base(o.Dir) != orgID && o.ID != orgID {
-					others++
-				}
-			}
-		}
-		if orgID != "" {
-			if err := store.RemoveOrg(cfg.CertsDir, orgID); err != nil {
-				log.Printf("could not finish removing credentials: %v", err)
-			}
-		} else {
-			if err := store.ClearEnrollment(cfg.CertsDir); err != nil {
-				log.Printf("could not finish removing credentials: %v", err)
-			}
-			if err := sysinfo.ClearState(cfg.CertsDir); err != nil {
-				log.Printf("could not clear system-info state: %v", err)
-			}
-		}
+		others := countOtherOrgs(cfg)
+		removeActiveCredentials(cfg)
 		if others > 0 {
 			log.Print(RevokedOrgMessage)
 		} else {
@@ -557,4 +596,65 @@ func settleRejection(ctx context.Context, cfg Config, rej Rejection) error {
 	}
 	<-ctx.Done()
 	return nil
+}
+
+// settleDeadCredential deletes local creds like revoke: the renewal token can
+// never succeed again, so keeping them leaves the tray looking enrolled while
+// connect can never place. Tray maps DeadCredentialUserMessage to Revoked.
+func settleDeadCredential(ctx context.Context, cfg Config) error {
+	others := countOtherOrgs(cfg)
+	removeActiveCredentials(cfg)
+	if others > 0 {
+		log.Print(DeadCredentialOrgMessage)
+	} else {
+		log.Print(DeadCredentialUserMessage)
+	}
+	<-ctx.Done()
+	return nil
+}
+
+func settleClockSkew(ctx context.Context, skew *clockSkewError) error {
+	_ = skew
+	log.Print(ClockSkewUserMessage)
+	<-ctx.Done()
+	return nil
+}
+
+func removeActiveCredentials(cfg Config) {
+	orgID, _ := store.ReadActive(cfg.CertsDir)
+	if orgID == "" {
+		if dir, err := store.ResolveActiveDir(cfg.CertsDir); err == nil {
+			orgID = filepath.Base(dir)
+		}
+	}
+	if orgID != "" {
+		if err := store.RemoveOrg(cfg.CertsDir, orgID); err != nil {
+			log.Printf("could not finish removing credentials: %v", err)
+		}
+		return
+	}
+	if err := store.ClearEnrollment(cfg.CertsDir); err != nil {
+		log.Printf("could not finish removing credentials: %v", err)
+	}
+	if err := sysinfo.ClearState(cfg.CertsDir); err != nil {
+		log.Printf("could not clear system-info state: %v", err)
+	}
+}
+
+func countOtherOrgs(cfg Config) int {
+	orgID, _ := store.ReadActive(cfg.CertsDir)
+	if orgID == "" {
+		if dir, err := store.ResolveActiveDir(cfg.CertsDir); err == nil {
+			orgID = filepath.Base(dir)
+		}
+	}
+	others := 0
+	if orgs, err := store.List(cfg.CertsDir); err == nil {
+		for _, o := range orgs {
+			if filepath.Base(o.Dir) != orgID && o.ID != orgID {
+				others++
+			}
+		}
+	}
+	return others
 }
