@@ -297,12 +297,19 @@ func (s *session) renewLoop(ctx context.Context, cfg Config) {
 		case <-wakeTicker.C:
 			now := time.Now()
 			if IsWakeEvent(lastWall, now, pingEvery) {
-				attemptRenew(cfg)
+				if err := attemptRenew(cfg); err != nil {
+					// Drop the session so Run's next iteration settles terminal auth/clock death.
+					_ = s.conn.Close()
+					return
+				}
 			}
 			lastWall = now
 		case <-renewTicker.C:
 			lastWall = time.Now()
-			attemptRenew(cfg)
+			if err := attemptRenew(cfg); err != nil {
+				_ = s.conn.Close()
+				return
+			}
 		}
 	}
 }
