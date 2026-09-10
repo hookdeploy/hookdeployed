@@ -62,10 +62,13 @@ printf '%s\n' "${out}" | grep -q "dry-run: apt install" || fail "non-TTY should 
 rm -rf "${tmp}"
 
 # --- no token, TTY, empty input → no-token path ---
+# bash `read -p` only displays the prompt when stdin is a real terminal, so a
+# piped FORCE_TTY=1 run still takes the read path but will not emit the prompt
+# text. Assert the skip/install behavior instead.
 tmp="$(mktemp -d)"
 out="$(printf '\n' | HOOKDEPLOYED_FORCE_TTY=1 run_wrapper "${tmp}" 2>&1)"
 [ ! -f "${tmp}/preseed" ] || fail "empty TTY input must not preseed"
-printf '%s\n' "${out}" | grep -q "Enter your HookDeploy enrollment token" || fail "TTY should prompt"
+printf '%s\n' "${out}" | grep -q "no token given" || fail "empty TTY skip should print instructions"
 printf '%s\n' "${out}" | grep -q "dry-run: apt install" || fail "empty TTY skip should still install"
 rm -rf "${tmp}"
 
