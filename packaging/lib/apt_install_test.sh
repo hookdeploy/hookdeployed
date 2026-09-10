@@ -23,7 +23,9 @@ run_wrapper() {
 tmp="$(mktemp -d)"
 HOOKDEPLOYED_TOKEN="from-env" run_wrapper "${tmp}" --token "from-flag" >/dev/null
 grep -q 'string from-flag$' "${tmp}/preseed" || fail "flag should win over HOOKDEPLOYED_TOKEN"
-grep -q 'from-env' "${tmp}/preseed" && fail "env token leaked when --token set"
+if grep -q 'from-env' "${tmp}/preseed"; then
+  fail "env token leaked when --token set"
+fi
 rm -rf "${tmp}"
 
 # --- env alone ---
@@ -43,7 +45,9 @@ tmp="$(mktemp -d)"
 cr=$'hd_enroll_us_abc\r'
 run_wrapper "${tmp}" --token "${cr}" >/dev/null
 got="$(cat "${tmp}/preseed")"
-printf '%s\n' "${got}" | grep -q $'\r' && fail "CR should be stripped from preseed line"
+if printf '%s\n' "${got}" | grep -q $'\r'; then
+  fail "CR should be stripped from preseed line"
+fi
 printf '%s\n' "${got}" | grep -q 'string hd_enroll_us_abc$' || fail "stripped token missing from preseed"
 rm -rf "${tmp}"
 

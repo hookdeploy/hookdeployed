@@ -60,12 +60,13 @@ got="$(cat "${TOKEN_OUT}")"
 [ "${got}" = "${FULL_TOKEN}" ] || fail "CR should be stripped; got [${got}]"
 
 # --- Invalid token: return 1, do not exit the shell ---
+# enroll_with_token does `set -e` before `return 1`, which turns errexit
+# back on for the whole shell. Call it in `if` (same as postinst) so the
+# failure is tested instead of aborting this script.
 ENROLL_EC=1
-set +e
-enroll_with_token /usr/bin/hookdeployed "not-a-real-token"
-ec=$?
-set -e
-[ "${ec}" -eq 1 ] || fail "enroll_with_token should return 1, got ${ec}"
+if enroll_with_token /usr/bin/hookdeployed "not-a-real-token"; then
+  fail "enroll_with_token should return 1, got 0"
+fi
 
 # --- postinst-shaped wrapper: enroll failure → instructions, exit 0 ---
 UNATTENDED_HINT="For unattended install, preseed hookdeployed/enroll_token or set HOOKDEPLOYED_TOKEN."
@@ -103,6 +104,8 @@ install_out="$(install_sh_token_path "hd_enroll_us_deadbeef" 2>&1)"
 install_ec=$?
 set -e
 [ "${install_ec}" -ne 0 ] || fail "install.sh --token path must still exit nonzero on enroll failure"
-printf '%s\n' "${install_out}" | grep -q "should-not-reach" && fail "install.sh must not continue after enroll failure"
+if printf '%s\n' "${install_out}" | grep -q "should-not-reach"; then
+  fail "install.sh must not continue after enroll failure"
+fi
 
 printf 'ok\n'
