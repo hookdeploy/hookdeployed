@@ -189,13 +189,99 @@ func (s *session) handleDeliver(w http.ResponseWriter, r *http.Request) {
 		copyHeaders(w.Header(), resp.Header)
 		w.Header().Set(HeaderError, ErrLocalError)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		finishDeliverBody(w, resp)
 		return
 	}
 
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	finishDeliverBody(w, resp)
+}
+
+func bodylessStatus(code int) bool {
+	return code == http.StatusSwitchingProtocols ||
+		code == http.StatusNoContent ||
+		code == http.StatusResetContent ||
+		code == http.StatusNotModified ||
+		(code >= 100 && code < 200)
+}
+
+// localResponseHasBody reports whether the local response indicated a body
+// was coming. Used after status is committed: a zero-byte copy of an
+// expected body is treated as truncation, not a clean empty success.
+func localResponseHasBody(resp *http.Response) bool {
+	if bodylessStatus(resp.StatusCode) {
+		return false
+	}
+	if resp.ContentLength > 0 {
+		return true
+	}
+	for _, te := range resp.TransferEncoding {
+		if strings.EqualFold(te, "chunked") {
+			return true
+		}
+	}
+	// HTTP/1.1 without Content-Length uses chunked; HTTP/2 often
+	// omits Content-Length (ContentLength == -1).
+	return resp.ContentLength != 0
+}
+
+func localResponseTruncated(resp *http.Response, n int64, copyErr error) bool {
+	if copyErr != nil {
+		return true
+	}
+	if resp.ContentLength > 0 && n < resp.ContentLength {
+		return true
+	}
+	return n == 0 && localResponseHasBody(resp)
+}
+
+func copyDeliverBody(w http.ResponseWriter, body io.Reader) (int64, error) {
+	flusher, canFlush := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	var written int64
+	flushed := false
+	for {
+		nr, readErr := body.Read(buf)
+		if nr > 0 {
+			nw, writeErr := w.Write(buf[:nr])
+			written += int64(nw)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if nw != nr {
+				return written, io.ErrShortWrite
+			}
+			if canFlush && !flushed {
+				flusher.Flush()
+				flushed = true
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
+}
+
+// finishDeliverBody copies the local response body after WriteHeader has
+// already committed the status. A copy error or short body must not look
+// like a clean END_STREAM to the relay: panic(http.ErrAbortHandler) is
+// recovered by golang.org/x/net/http2 as RST_STREAM (INTERNAL_ERROR)
+// without an error log.
+func finishDeliverBody(w http.ResponseWriter, resp *http.Response) {
+	n, copyErr := copyDeliverBody(w, resp.Body)
+	if !localResponseTruncated(resp, n, copyErr) {
+		return
+	}
+	log.Printf("local deliver truncated after status=%d copied=%d declared=%d err=%v",
+		resp.StatusCode, n, resp.ContentLength, copyErr)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	panic(http.ErrAbortHandler)
 }
 
 func classifyLocalErr(err error) string {
