@@ -16,6 +16,7 @@ run_wrapper() {
     HOOKDEPLOYED_SOURCES_LIST="${tmp}/hookdeployed.list" \
     HOOKDEPLOYED_PRESEED_LOG="${tmp}/preseed" \
     HOOKDEPLOYED_APT_BASE="https://apt.hookdeploy.dev" \
+    HOOKDEPLOYED_FORCE_TTY="${HOOKDEPLOYED_FORCE_TTY:-}" \
     bash "${SCRIPT}" "$@"
 }
 
