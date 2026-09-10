@@ -42,15 +42,26 @@ func LoadOrgMeta(dir string) (OrgMeta, error) {
 	return meta, nil
 }
 
+// certDirFromUserConfig is the path suffix every platform shares once Go's
+// os.UserConfigDir (or the tray's platform_user_config_dir) has been resolved.
+// hookdeploy-tray supervisor.rs default_certs_dir joins the same hookdeploy/certs.
+func certDirFromUserConfig(userConfigDir string) string {
+	return filepath.Join(userConfigDir, "hookdeploy", "certs")
+}
+
+func defaultDirFromUserConfig(userConfigDir string, err error) string {
+	if err != nil || userConfigDir == "" {
+		return "certs"
+	}
+	return certDirFromUserConfig(userConfigDir)
+}
+
 func DefaultDir() string {
 	if env := os.Getenv("HOOKDEPLOY_CERT_DIR"); env != "" {
 		return env
 	}
 	home, err := os.UserConfigDir()
-	if err != nil || home == "" {
-		return "certs"
-	}
-	return filepath.Join(home, "hookdeploy", "certs")
+	return defaultDirFromUserConfig(home, err)
 }
 
 // WriteBundle stores:
