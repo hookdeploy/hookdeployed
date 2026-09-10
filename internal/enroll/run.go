@@ -121,6 +121,10 @@ func runDevice(baseURL, certDir string, io deviceIO) error {
 			continue
 		case "denied", "expired":
 			return fmt.Errorf("enrollment %s", poll.Status)
+		case "consumed":
+			// Distinct from "enrollment expired" and "token already consumed" —
+			// the tray classifier keys off those substrings.
+			return fmt.Errorf("enrollment already completed")
 		case "approved":
 			if poll.Certificate == "" {
 				if poll.AgentID == "" {

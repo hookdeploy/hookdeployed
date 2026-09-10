@@ -191,6 +191,39 @@ func TestDevicePollExpiredStatusFailsCleanly(t *testing.T) {
 	}
 }
 
+func TestDevicePollConsumedStatusFailsCleanly(t *testing.T) {
+	var polls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/enroll/device/start":
+			w.Header().Set("content-type", "application/json")
+			_, _ = w.Write([]byte(`{"session_id":"s1","device_code":"dev","verification_url":"https://app.example/app/cli-auth/s1","interval":1,"expires_in":600}`))
+		case "/v1/enroll/device/poll":
+			polls.Add(1)
+			w.Header().Set("content-type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"consumed","interval":1}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	err := runDevice(srv.URL, t.TempDir(), deviceIO{
+		In:      strings.NewReader("ABCD1234\n"),
+		Out:     io.Discard,
+		OpenURL: func(string) {},
+	})
+	if err == nil || err.Error() != "enrollment already completed" {
+		t.Fatalf("err=%v", err)
+	}
+	if err.Error() == "enrollment expired" || err.Error() == "token already consumed" {
+		t.Fatalf("consumed must not reuse expired/token-consumed copy: %v", err)
+	}
+	if polls.Load() != 1 {
+		t.Fatalf("polls=%d want 1 (consumed must not keep polling)", polls.Load())
+	}
+}
+
 func TestDevicePollDeniedFailsCleanly(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
