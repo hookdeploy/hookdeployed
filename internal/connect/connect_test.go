@@ -1036,6 +1036,122 @@ func TestFailedLocalDeliverKeepsSession(t *testing.T) {
 	}
 }
 
+func TestDeliverLocalDiesMidResponseLeavesStatus(t *testing.T) {
+	pki, err := mtls.GenerateTestPKI()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := writeEnrolled(dir, pki); err != nil {
+		t.Fatal(err)
+	}
+
+	wrote := make(chan struct{})
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("X-Partial", "1")
+		w.WriteHeader(http.StatusCreated)
+		if _, err := w.Write([]byte("half-")); err != nil {
+			return
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		close(wrote)
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer local.Close()
+
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", pki.ServerTLSConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	type result struct {
+		status  int
+		hdrErr  string
+		body    string
+		readErr error
+		tripErr error
+	}
+	got := make(chan result, 1)
+	go func() {
+		cc, conn, err := acceptH2Client(ln)
+		if err != nil {
+			got <- result{tripErr: err}
+			return
+		}
+		defer conn.Close()
+		req, _ := http.NewRequest(http.MethodPost, "https://agent/hooks/die", strings.NewReader("x"))
+		req.Header.Set("X-Hd-Target-Port", "9999")
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
+			got <- result{tripErr: err}
+			return
+		}
+		b, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		got <- result{
+			status:  resp.StatusCode,
+			hdrErr:  resp.Header.Get(HeaderError),
+			body:    string(b),
+			readErr: readErr,
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- Run(ctx, Config{
+			Relay:        ln.Addr().String(),
+			CertsDir:     dir,
+			EnrollURL:    "http://127.0.0.1:1",
+			PingInterval: time.Hour,
+			LocalURL:     local.URL,
+		})
+	}()
+
+	select {
+	case <-wrote:
+	case err := <-errCh:
+		t.Fatalf("connect exited: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("local handler never wrote half-")
+	}
+
+	select {
+	case r := <-got:
+		if r.tripErr != nil {
+			t.Fatalf("headers never arrived: %v", r.tripErr)
+		}
+		if r.status != http.StatusCreated {
+			t.Fatalf("status=%d body=%q — local status was already sent", r.status, r.body)
+		}
+		if r.hdrErr != "" {
+			t.Fatalf("mid-stream death must not rewrite status via x-hd-error=%s", r.hdrErr)
+		}
+		if r.readErr == nil {
+			t.Fatalf("expected stream reset after truncated local body, got clean body=%q", r.body)
+		}
+	case err := <-errCh:
+		t.Fatalf("connect exited: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for relay-side client")
+	}
+	cancel()
+	<-errCh
+}
+
 func TestLargeDeliverDoesNotBlockPing(t *testing.T) {
 	pki, err := mtls.GenerateTestPKI()
 	if err != nil {
