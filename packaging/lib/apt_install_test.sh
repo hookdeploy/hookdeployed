@@ -4,9 +4,19 @@ set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 SCRIPT="${ROOT}/packaging/apt-install.sh"
+FIXTURE="${ROOT}/packaging/fixtures/apt-r2-layout.json"
 [ -f "${SCRIPT}" ] || { printf 'missing %s\n' "${SCRIPT}" >&2; exit 1; }
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+[ -f "${FIXTURE}" ] || fail "missing cross-repo fixture ${FIXTURE}"
+
+# Paths packaging/apt-install.sh fetches over HTTP (${APT_BASE}/… in curl / dry-run logs).
+extract_installer_http_paths() {
+  grep -oE '\$\{APT_BASE\}/[^" |]+' "${SCRIPT}" \
+    | sed 's/\${APT_BASE}\///' \
+    | sort -u
+}
 
 run_wrapper() {
   local tmp="$1"
@@ -96,5 +106,53 @@ fi
 if grep -q '/usr/local/bin' "${SCRIPT}"; then
   fail "apt-install.sh must not install to /usr/local/bin (that is the tarball path)"
 fi
+
+# --- cross-repo R2 layout contract (mirror: platform/apt-worker/fixtures/apt-r2-layout.json) ---
+command -v jq >/dev/null 2>&1 || fail "jq required for apt-r2-layout fixture contract tests"
+
+fixture_paths="$(jq -r '.installerHttpPaths[]' "${FIXTURE}" | sort)"
+script_paths="$(extract_installer_http_paths)"
+if [ "$(printf '%s\n' "${fixture_paths}" | sed '/^$/d' | wc -l)" \
+  -ne "$(printf '%s\n' "${script_paths}" | sed '/^$/d' | wc -l)" ]; then
+  fail "installer HTTP path count mismatch between apt-install.sh and fixture"
+fi
+while IFS= read -r path; do
+  [ -n "${path}" ] || continue
+  printf '%s\n' "${script_paths}" | grep -qx "${path}" \
+    || fail "apt-install.sh missing fixture installer path: ${path}"
+done <<EOF
+${fixture_paths}
+EOF
+while IFS= read -r path; do
+  [ -n "${path}" ] || continue
+  printf '%s\n' "${fixture_paths}" | grep -qx "${path}" \
+    || fail "fixture missing apt-install.sh installer path: ${path}"
+done <<EOF
+${script_paths}
+EOF
+
+tmp="$(mktemp -d)"
+out="$(run_wrapper "${tmp}")"
+while IFS= read -r path; do
+  [ -n "${path}" ] || continue
+  printf '%s\n' "${out}" | grep -q "dry-run: curl -fsSL https://apt.hookdeploy.dev/${path}" \
+    || fail "dry-run missing curl URL for ${path}"
+done <<EOF
+${fixture_paths}
+EOF
+
+suite="$(jq -r '.aptSuite' "${FIXTURE}")"
+component="$(jq -r '.aptComponent' "${FIXTURE}")"
+grep -q "deb \\[signed-by=.*\\] https://apt.hookdeploy.dev ${suite} ${component}\$" "${tmp}/hookdeployed.list" \
+  || fail "sources.list must use fixture suite/component (${suite} ${component})"
+
+while IFS= read -r path; do
+  [ -n "${path}" ] || continue
+  jq -e --arg p "${path}" '.objects | has($p)' "${FIXTURE}" >/dev/null \
+    || fail "installer path ${path} missing from fixture objects"
+done <<EOF
+${fixture_paths}
+EOF
+rm -rf "${tmp}"
 
 printf 'ok\n'
