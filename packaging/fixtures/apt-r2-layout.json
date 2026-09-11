@@ -1,0 +1,57 @@
+{
+  "_documentation": "Cross-repo APT R2 object layout contract. Canonical copy: hookdeployed/packaging/fixtures/apt-r2-layout.json. Mirror: platform/apt-worker/fixtures/apt-r2-layout.json (hookdeploy/platform). Update BOTH when packaging/build-apt-repo.sh output paths, manual R2 uploads, or packaging/apt-install.sh HTTP fetch paths change.",
+  "fixtureVersion": 1,
+  "debVersion": "0.1.1-1",
+  "aptSuite": "stable",
+  "aptComponent": "main",
+  "aptArchitectures": ["amd64", "arm64"],
+  "installerHttpPaths": [
+    "hookdeployed.gpg"
+  ],
+  "objects": {
+    "hookdeployed.gpg": {
+      "contentType": "application/pgp-keys",
+      "source": "manual-upload"
+    },
+    "install.sh": {
+      "contentType": "text/x-shellscript",
+      "source": "manual-upload"
+    },
+    "pool/main/h/hookdeployed/hookdeployed_0.1.1-1_amd64.deb": {
+      "contentType": "application/vnd.debian.binary-package",
+      "source": "build-apt-repo.sh"
+    },
+    "pool/main/h/hookdeployed/hookdeployed_0.1.1-1_arm64.deb": {
+      "contentType": "application/vnd.debian.binary-package",
+      "source": "build-apt-repo.sh"
+    },
+    "dists/stable/main/binary-amd64/Packages": {
+      "contentType": "text/plain; charset=utf-8",
+      "source": "build-apt-repo.sh"
+    },
+    "dists/stable/main/binary-amd64/Packages.gz": {
+      "contentType": "application/gzip",
+      "source": "build-apt-repo.sh"
+    },
+    "dists/stable/main/binary-arm64/Packages": {
+      "contentType": "text/plain; charset=utf-8",
+      "source": "build-apt-repo.sh"
+    },
+    "dists/stable/main/binary-arm64/Packages.gz": {
+      "contentType": "application/gzip",
+      "source": "build-apt-repo.sh"
+    },
+    "dists/stable/Release": {
+      "contentType": "text/plain; charset=utf-8",
+      "source": "build-apt-repo.sh"
+    },
+    "dists/stable/InRelease": {
+      "contentType": "text/plain; charset=utf-8",
+      "source": "build-apt-repo.sh"
+    },
+    "dists/stable/Release.gpg": {
+      "contentType": "application/pgp-signature",
+      "source": "build-apt-repo.sh"
+    }
+  }
+}
